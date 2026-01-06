@@ -17,10 +17,9 @@ Algorithm:
    - Zero out the remaining weights
 4. Save pruned model
 
-Special Handling for lm_head:
-- lm_head is often very large (e.g., [vocab_size × hidden_dim])
-- For models with large vocab (32k-128k), this causes OOM
-- Solution: Process output dimension in chunks
+Special Handling:
+- lm_head layer is NOT pruned (keeps original weights)
+- This preserves output quality and vocabulary distribution
 """
 
 import torch
@@ -51,13 +50,12 @@ class WandaPruner:
     Special handling for large layers (lm_head).
     """
 
-    def __init__(self, model, tokenizer, device="cuda", sparsity=0.5, max_tokens_per_sample=512, lmhead_chunks=4):
+    def __init__(self, model, tokenizer, device="cuda", sparsity=0.5, max_tokens_per_sample=512):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.sparsity = sparsity  # Percentage of weights to PRUNE (e.g., 0.5 means keep 50%, prune 50%)
         self.max_tokens_per_sample = max_tokens_per_sample  # Subsample to save memory
-        self.lmhead_chunks = lmhead_chunks
 
         # Storage for activations
         self.activation_data = {}
@@ -69,7 +67,7 @@ class WandaPruner:
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample (memory optimization)")
         print(f"  Salience metric: E[|X|] (L1 norm)")
         print(f"  Scoring: Score_ij = |W_ij| * E[|X|]_j")
-        print(f"  Special: lm_head split into {lmhead_chunks} chunks to avoid OOM")
+        print(f"  Special: lm_head is NOT pruned (keeps original weights)")
 
 
     @torch.no_grad()
@@ -185,87 +183,6 @@ class WandaPruner:
         if debug:
             print(f"  → Target sparsity: {self.sparsity*100:.1f}%, Actual: {actual_sparsity*100:.2f}%")
 
-    @torch.no_grad()
-    def prune_lmhead_chunked(self, name, module, debug=False, num_chunks=4):
-        """
-        Prune lm_head by splitting it into N chunks along output dimension.
-        This reduces peak memory usage significantly.
-
-        Args:
-            num_chunks: Number of chunks to split into (default: 4 for very large lm_heads)
-        """
-        print(f"\n  🔧 Special handling for {name} (split into {num_chunks} chunks)")
-
-        if name not in self.activation_data or len(self.activation_data[name]) == 0:
-            print(f"  ⚠️  No activation data for {name}, skipping pruning")
-            return
-
-        # Get L1 activation salience
-        activation_salience = self.get_activation_salience_l1(name)
-        if activation_salience is None:
-            print(f"  ⚠️  No activation salience for {name}, skipping")
-            return
-
-        W = module.weight.data
-        original_dtype = W.dtype
-        out_features, in_features = W.shape
-
-        print(f"     Shape: {W.shape} ({W.numel() / 1e6:.1f}M parameters)")
-
-        # Calculate chunk boundaries
-        chunk_size = out_features // num_chunks
-        chunk_boundaries = [(i * chunk_size,
-                            out_features if i == num_chunks - 1 else (i + 1) * chunk_size)
-                           for i in range(num_chunks)]
-
-        W_pruned_chunks = []
-        chunk_stats = []
-
-        salience_device = activation_salience.to(self.device)
-
-        # Process each chunk
-        for chunk_idx, (start_idx, end_idx) in enumerate(chunk_boundaries):
-            print(f"     Processing chunk {chunk_idx + 1}/{num_chunks}: rows {start_idx}-{end_idx}")
-
-            # Get chunk of weights
-            W_chunk = W[start_idx:end_idx, :].to(self.device)
-
-            # Apply Wanda pruning to this chunk
-            W_pruned_chunk, actual_sparsity = self.prune_weights_wanda(W_chunk, salience_device, self.sparsity)
-
-            W_pruned_chunks.append(W_pruned_chunk.to(original_dtype))
-            chunk_stats.append({
-                'actual_sparsity': actual_sparsity
-            })
-
-            # Cleanup
-            del W_chunk, W_pruned_chunk
-            torch.cuda.empty_cache()
-
-        # Combine all chunks
-        W_final = torch.cat(W_pruned_chunks, dim=0)
-        module.weight.data = W_final
-
-        # Store average statistics
-        avg_sparsity = np.mean([s['actual_sparsity'] for s in chunk_stats])
-
-        self.layer_stats[name] = {
-            'target_sparsity': self.sparsity,
-            'actual_sparsity': avg_sparsity,
-            'salience_mean': activation_salience.mean().item(),
-            'salience_max': activation_salience.max().item(),
-        }
-
-        for i, stat in enumerate(chunk_stats):
-            self.layer_stats[name][f'sparsity_chunk{i+1}'] = stat['actual_sparsity']
-
-        # Print summary
-        sparsity_str = ', '.join([f's_{i+1}={s["actual_sparsity"]*100:.2f}%' for i, s in enumerate(chunk_stats)])
-        print(f"     ✓ Done: {sparsity_str}")
-
-        del W_pruned_chunks, chunk_stats, W_final
-        torch.cuda.empty_cache()
-
     def calibrate_layer_batch(self, layer_names_batch, calibration_data, n_samples=500):
         """
         Calibrate a BATCH of layers simultaneously.
@@ -376,15 +293,15 @@ class WandaPruner:
             self.calibrate_layer_batch(batch_layers, calibration_data, n_samples)
 
             # STEP 2: Prune each layer in the batch
-            for idx_in_batch, (name, module) in enumerate(tqdm(batch_layers, desc=f"Pruning Batch {batch_idx+1}")):
+            for _, (name, module) in enumerate(tqdm(batch_layers, desc=f"Pruning Batch {batch_idx+1}")):
                 try:
-                    # Check if this is lm_head (special handling)
+                    # Check if this is lm_head (skip pruning to preserve output quality)
                     is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
 
                     if is_lmhead:
-                        # Use chunked processing for lm_head
-                        debug = (pruned_count < 2)
-                        self.prune_lmhead_chunked(name, module, debug=debug, num_chunks=self.lmhead_chunks)
+                        # Skip lm_head pruning - keep original weights
+                        print(f"\n  ⏭️  Skipping {name} (keeping original weights)")
+                        skipped_count += 1
                     else:
                         # Standard processing for other layers
                         # Debug output for first few layers
@@ -394,7 +311,7 @@ class WandaPruner:
                         else:
                             self.prune_layer(name, module)
 
-                    pruned_count += 1
+                        pruned_count += 1
 
                 except Exception as e:
                     print(f"\n⚠️  Error pruning {name}: {e}")
@@ -413,6 +330,7 @@ class WandaPruner:
 
         print(f"\n✅ Sequential Pruning Complete!")
         print(f"   Total layers pruned: {pruned_count}/{len(layer_names)}")
+        print(f"   Skipped layers (lm_head, etc.): {skipped_count}")
 
         if self.layer_stats:
             sparsities = [info['actual_sparsity'] for info in self.layer_stats.values()]
@@ -456,8 +374,6 @@ def main():
     parser.add_argument("--layer-batch-size", type=int, default=16,
                        help="Number of layers to calibrate simultaneously. "
                             "XL models require smaller batches due to larger hidden dim.")
-    parser.add_argument("--lmhead-chunks", type=int, default=4,
-                       help="Number of chunks to split lm_head into (default: 4, higher = less memory)")
     parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
                        help="Directory to cache calibration data (default: ./calibration_cache)")
     args = parser.parse_args()
@@ -480,7 +396,7 @@ def main():
     print(f"Device: {device}")
     print(f"Target Sparsity: {args.sparsity*100:.1f}%")
     print(f"Layer Batch Size: {args.layer_batch_size}")
-    print(f"Special: lm_head split into {args.lmhead_chunks} chunks")
+    print(f"Special: lm_head is NOT pruned (keeps original weights)")
     print("=" * 80)
 
     # Load model and tokenizer
@@ -515,8 +431,7 @@ def main():
         tokenizer=tokenizer,
         device=device,
         sparsity=args.sparsity,
-        max_tokens_per_sample=args.max_tokens_per_sample,
-        lmhead_chunks=args.lmhead_chunks
+        max_tokens_per_sample=args.max_tokens_per_sample
     )
 
     # Batched sequential pruning
