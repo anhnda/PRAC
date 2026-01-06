@@ -1,16 +1,16 @@
 """
-Wanda Pruning Implementation with L1 Salience
+Wanda Pruning Implementation with L2 Norm Salience
 ADAPTED FOR: Extra Large Models (XL) - Special handling for large layers like lm_head
 
 Key Features:
 - Structured magnitude pruning based on activation salience
-- Uses E[|X|] (L1 norm) for activation salience
-- Scoring: Score_ij = |W_ij| * E[|X|]_j
+- Uses L2 norm for activation salience
+- Scoring: Score_ij = |W_ij| * ||X_j||_2
 - Per-row (output channel) top-p% selection
 - Batched sequential processing for memory efficiency
 
 Algorithm:
-1. Compute per-input-channel salience: s[j] = E[|X[:, j]|] (L1 norm)
+1. Compute per-input-channel salience: s[j] = ||X_j||_2 (L2 norm across all tokens)
 2. Score each weight: Score_ij = |W_ij| * s[j]
 3. For each output channel (row i):
    - Keep top p% highest scoring weights
@@ -46,7 +46,7 @@ from calibration_utils import get_c4_calibration_data, get_wikitext2_calibration
 
 class WandaPruner:
     """
-    Wanda Pruning with L1 Salience.
+    Wanda Pruning with L2 Norm Salience.
     Special handling for large layers (lm_head).
     """
 
@@ -65,34 +65,37 @@ class WandaPruner:
         print(f"\n[Wanda Pruner Initialized - XL Version]")
         print(f"  Target sparsity: {sparsity*100:.1f}% (keep {(1-sparsity)*100:.1f}%)")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample (memory optimization)")
-        print(f"  Salience metric: E[|X|] (L1 norm)")
-        print(f"  Scoring: Score_ij = |W_ij| * E[|X|]_j")
+        print(f"  Salience metric: ||X_j||_2 (L2 norm across all tokens)")
+        print(f"  Scoring: Score_ij = |W_ij| * ||X_j||_2")
         print(f"  Special: lm_head is NOT pruned (keeps original weights)")
 
 
     @torch.no_grad()
-    def get_activation_salience_l1(self, name):
+    def get_activation_salience_l2(self, name):
         """
-        Compute per-input-channel activation salience using L1 norm: E[|X[:, j]|]
+        Compute per-input-channel activation salience using L2 norm: ||X_j||_2
+
+        Where X_j is the j-th input channel across all calibration tokens.
+        ||X_j||_2 = sqrt(sum(X_j^2))
         """
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None
 
         X_list = self.activation_data[name]
-        total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
         in_features = X_list[0].shape[-1]
 
-        # Accumulate L1 salience on CPU to save GPU VRAM
-        salience_sum = torch.zeros(in_features)
+        # Accumulate squared values for L2 norm on CPU to save GPU VRAM
+        squared_sum = torch.zeros(in_features)
 
         for x in X_list:
             x_flat = x.reshape(-1, x.shape[-1])
-            # Use abs() for L1 Norm
             # Ensure we're working with float32 for numerical stability
             x_flat = x_flat.float()
-            salience_sum += x_flat.abs().sum(dim=0)
+            # Accumulate sum of squares
+            squared_sum += x_flat.pow(2).sum(dim=0)
 
-        salience = salience_sum / total_samples
+        # L2 norm: sqrt of sum of squares
+        salience = torch.sqrt(squared_sum)
         return salience
 
     @torch.no_grad()
@@ -148,8 +151,8 @@ class WandaPruner:
             print(f"  ⚠️  No activation data for {name}, skipping pruning")
             return
 
-        # Get L1 activation salience
-        activation_salience = self.get_activation_salience_l1(name)
+        # Get L2 norm activation salience
+        activation_salience = self.get_activation_salience_l2(name)
         if activation_salience is None:
             if debug:
                 print(f"  DEBUG: No activation salience for {name}, skipping")
@@ -250,7 +253,7 @@ class WandaPruner:
                 indices = indices.sort()[0]
                 inp = inp[:, indices, :]
 
-            # Store activation on CPU (use float32 for numerical stability in L1 computation)
+            # Store activation on CPU (use float32 for numerical stability in L2 norm computation)
             inp_stored = inp.detach().cpu().float().clone()
             self.activation_data[name].append(inp_stored)
             del inp
@@ -355,7 +358,7 @@ def load_wikitext2_simple(n_samples=128):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Wanda Pruning with L1 Salience for XL Models",
+        description="Wanda Pruning with L2 Norm Salience for XL Models",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
@@ -390,7 +393,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Wanda Pruning with L1 Salience (XL Version)")
+    print("Wanda Pruning with L2 Norm Salience (XL Version)")
     print(f"Target Model: {model_name}")
     print("=" * 80)
     print(f"Device: {device}")
