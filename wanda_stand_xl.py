@@ -228,7 +228,7 @@ class WandaPruner:
         print(f"Successfully tokenized {len(input_ids_list)} samples")
         return input_ids_list, attention_mask_list
 
-    def get_layer_inputs(self, layer_module, inputs, attention_mask, position_ids=None, position_embeddings=None):
+    def get_layer_inputs(self, layer_module, inputs, attention_mask, position_ids=None):
         """
         Run inputs through a transformer layer and capture the input to linear sublayers.
         Returns the layer's inputs (for pruning) and outputs (for next layer).
@@ -255,20 +255,23 @@ class WandaPruner:
                 handle = module.register_forward_hook(capture_hook(name))
                 handles.append(handle)
 
+        # Move to device
+        inputs = inputs.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        if position_ids is not None:
+            position_ids = position_ids.to(self.device)
+
         # Run forward pass through this layer
         with torch.no_grad():
-            # Try different argument combinations based on model architecture
             try:
-                # For Mistral/Llama with RoPE
-                if position_embeddings is not None:
-                    outputs = layer_module(inputs, attention_mask=attention_mask, position_embeddings=position_embeddings)
-                elif position_ids is not None:
-                    outputs = layer_module(inputs, attention_mask=attention_mask, position_ids=position_ids)
-                else:
-                    outputs = layer_module(inputs, attention_mask=attention_mask)
-            except TypeError as e:
-                # Fallback: try without position args
-                print(f"Warning: Error with position args ({e}), trying without...")
+                # Standard HF API: hidden_states, attention_mask, position_ids
+                outputs = layer_module(
+                    inputs,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids
+                )
+            except TypeError:
+                # Fallback for older models that might infer position_ids
                 outputs = layer_module(inputs, attention_mask=attention_mask)
 
             # Extract hidden states (first element of tuple for most models)
@@ -316,52 +319,37 @@ class WandaPruner:
             print("\n❌ No valid calibration samples!")
             return
 
-        # Get embeddings and position embeddings for all samples
-        print("\nComputing embeddings and position embeddings...")
+        # Get embeddings and position_ids for all samples
+        print("\nComputing embeddings and position_ids...")
         with torch.no_grad():
             # Get embedding layer
             if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
                 embed_layer = self.model.model.embed_tokens
-                # Try to get rotary embedding layer for Mistral/Llama
-                try:
-                    rotary_emb = transformer_layers[0].self_attn.rotary_emb
-                    use_rope = True
-                except:
-                    rotary_emb = None
-                    use_rope = False
             elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'wte'):
                 embed_layer = self.model.transformer.wte
-                rotary_emb = None
-                use_rope = False
             else:
                 print("❌ Could not find embedding layer")
                 return
 
-            # Compute embeddings and position embeddings for all samples
+            # Compute embeddings and position_ids for all samples
             embeddings_list = []
-            position_embeddings_list = []
+            position_ids_list = []
             for input_ids, attention_mask in tqdm(zip(input_ids_list, attention_mask_list),
                                                    desc="Embedding", total=len(input_ids_list)):
                 input_ids_device = input_ids.to(self.device)
+                attention_mask_device = attention_mask.to(self.device)
+
+                # 1. Get initial token embeddings
                 emb = embed_layer(input_ids_device)
-                embeddings_list.append(emb)
+                embeddings_list.append(emb.detach().cpu())  # Store on CPU to save VRAM
 
-                # Compute position embeddings if using RoPE
-                if use_rope and rotary_emb is not None:
-                    attention_mask_device = attention_mask.to(self.device)
-                    position_ids = attention_mask_device.long().cumsum(-1) - 1
-                    position_ids.masked_fill_(attention_mask_device == 0, 0)
+                # 2. Compute correct position_ids (crucial for padded data)
+                # Create position_ids: 0 for padding, then 0, 1, 2... for real tokens
+                position_ids = attention_mask_device.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask_device == 0, 1)  # Set pad positions to 1 (arbitrary, ignored by mask)
+                position_ids_list.append(position_ids.detach().cpu())
 
-                    # Compute cos/sin position embeddings
-                    seq_len = input_ids.shape[1]
-                    position_embeddings = rotary_emb(emb, position_ids)
-                    position_embeddings_list.append(position_embeddings)
-
-                    del attention_mask_device, position_ids
-                else:
-                    position_embeddings_list.append(None)
-
-                del input_ids_device
+                del input_ids_device, attention_mask_device
 
         print(f"Embeddings computed for {len(embeddings_list)} samples")
 
@@ -378,13 +366,12 @@ class WandaPruner:
             all_linear_inputs = {}
             next_layer_inputs = []
 
-            for sample_idx, (hidden_states, attention_mask, position_embeddings) in enumerate(
-                zip(embeddings_list, attention_mask_list, position_embeddings_list)):
+            for sample_idx, (hidden_states, attention_mask, pos_ids) in enumerate(
+                zip(embeddings_list, attention_mask_list, position_ids_list)):
                 # Run layer forward pass and capture linear layer inputs
-                attention_mask_device = attention_mask.to(self.device)
                 linear_inputs, layer_output = self.get_layer_inputs(
-                    layer_module, hidden_states, attention_mask_device,
-                    position_ids=None, position_embeddings=position_embeddings
+                    layer_module, hidden_states, attention_mask,
+                    position_ids=pos_ids  # Pass the position_ids, not pre-computed embeddings
                 )
 
                 # Accumulate inputs for each linear sublayer
@@ -397,7 +384,7 @@ class WandaPruner:
                 next_layer_inputs.append(layer_output.detach())
 
                 # Cleanup
-                del attention_mask_device, layer_output
+                del layer_output
                 if (sample_idx + 1) % 10 == 0:
                     torch.cuda.empty_cache()
 
