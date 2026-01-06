@@ -307,8 +307,8 @@ class WandaPruner:
             print("\n❌ No valid calibration samples!")
             return
 
-        # Get embeddings for all samples
-        print("\nComputing embeddings...")
+        # Get embeddings and position_ids for all samples
+        print("\nComputing embeddings and position_ids...")
         with torch.no_grad():
             # Get embedding layer
             if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
@@ -319,13 +319,23 @@ class WandaPruner:
                 print("❌ Could not find embedding layer")
                 return
 
-            # Compute embeddings for all samples
+            # Compute embeddings and position_ids for all samples
             embeddings_list = []
-            for input_ids in tqdm(input_ids_list, desc="Embedding"):
+            position_ids_list = []
+            for input_ids, attention_mask in tqdm(zip(input_ids_list, attention_mask_list),
+                                                   desc="Embedding", total=len(input_ids_list)):
                 input_ids_device = input_ids.to(self.device)
                 emb = embed_layer(input_ids_device)
                 embeddings_list.append(emb)
-                del input_ids_device
+
+                # Create position_ids from attention_mask
+                # position_ids = cumsum(attention_mask) - 1
+                attention_mask_device = attention_mask.to(self.device)
+                position_ids = attention_mask_device.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask_device == 0, 0)
+                position_ids_list.append(position_ids)
+
+                del input_ids_device, attention_mask_device
 
         print(f"Embeddings computed for {len(embeddings_list)} samples")
 
@@ -342,11 +352,13 @@ class WandaPruner:
             all_linear_inputs = {}
             next_layer_inputs = []
 
-            for sample_idx, (hidden_states, attention_mask) in enumerate(zip(embeddings_list, attention_mask_list)):
+            for sample_idx, (hidden_states, attention_mask, position_ids) in enumerate(
+                zip(embeddings_list, attention_mask_list, position_ids_list)):
                 # Run layer forward pass and capture linear layer inputs
                 attention_mask_device = attention_mask.to(self.device)
+                position_ids_device = position_ids.to(self.device)
                 linear_inputs, layer_output = self.get_layer_inputs(
-                    layer_module, hidden_states, attention_mask_device
+                    layer_module, hidden_states, attention_mask_device, position_ids_device
                 )
 
                 # Accumulate inputs for each linear sublayer
@@ -359,7 +371,7 @@ class WandaPruner:
                 next_layer_inputs.append(layer_output.detach())
 
                 # Cleanup
-                del attention_mask_device, layer_output
+                del attention_mask_device, position_ids_device, layer_output
                 if (sample_idx + 1) % 10 == 0:
                     torch.cuda.empty_cache()
 
