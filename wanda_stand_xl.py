@@ -258,9 +258,15 @@ class WandaPruner:
 
         # Run forward pass through this layer
         with torch.no_grad():
-            # Ensure attention_mask has correct dtype (float or bool, not long)
-            if attention_mask is not None and attention_mask.dtype == torch.long:
-                attention_mask = attention_mask.float()
+            # Ensure all inputs are on the same device and have correct dtype
+            inputs = inputs.to(self.device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+                # Ensure correct dtype (float or bool, not long)
+                if attention_mask.dtype == torch.long:
+                    attention_mask = attention_mask.float()
+            if position_ids is not None:
+                position_ids = position_ids.to(self.device)
 
             # Prepare arguments based on what's available
             if position_embeddings is not None:
@@ -358,12 +364,12 @@ class WandaPruner:
 
                 # 1. Get initial token embeddings
                 emb = embed_layer(input_ids_device)
-                embeddings_list.append(emb.detach())  # Keep on GPU for now
+                embeddings_list.append(emb.detach().cpu())  # Store on CPU to save VRAM
 
                 # 2. Compute correct position_ids (crucial for padded data)
                 position_ids = attention_mask_device.long().cumsum(-1) - 1
                 position_ids.masked_fill_(attention_mask_device == 0, 1)
-                position_ids_list.append(position_ids.detach())
+                position_ids_list.append(position_ids.detach().cpu())
 
                 del input_ids_device, attention_mask_device
 
@@ -385,6 +391,11 @@ class WandaPruner:
 
             for sample_idx, (hidden_states, attention_mask, pos_ids) in enumerate(
                 zip(embeddings_list, attention_mask_list, position_ids_list)):
+                # Move to device
+                hidden_states = hidden_states.to(self.device)
+                attention_mask = attention_mask.to(self.device)
+                pos_ids = pos_ids.to(self.device)
+
                 # Compute position_embeddings for this sample if RoPE is available
                 if rotary_emb is not None:
                     # Compute cos/sin embeddings
