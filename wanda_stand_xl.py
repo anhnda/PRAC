@@ -219,7 +219,8 @@ class WandaPruner:
                 inputs = self.tokenizer(text, return_tensors="pt",
                                        truncation=True, max_length=512)
                 input_ids_list.append(inputs['input_ids'])
-                attention_mask_list.append(inputs['attention_mask'])
+                # Convert attention_mask to float to match model dtype
+                attention_mask_list.append(inputs['attention_mask'].float())
             except Exception as e:
                 if i == 0:
                     print(f"\n⚠️  Tokenization error: {str(e)[:100]}")
@@ -257,6 +258,10 @@ class WandaPruner:
 
         # Run forward pass through this layer
         with torch.no_grad():
+            # Ensure attention_mask has correct dtype (float or bool, not long)
+            if attention_mask is not None and attention_mask.dtype == torch.long:
+                attention_mask = attention_mask.float()
+
             # Prepare arguments based on what's available
             if position_embeddings is not None:
                 # For Mistral/Llama that need pre-computed position_embeddings
