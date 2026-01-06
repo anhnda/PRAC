@@ -166,99 +166,109 @@ class WandaPruner:
         return linear_inputs, outputs
 
     def prune_model_sequential(self, calibration_data, n_samples=500):
-        print("\n" + "="*50 + "\nSEQUENTIAL PRUNING START\n" + "="*50)
-        
+        """
+        ORIGINAL WANDA APPROACH:
+        1. Collect activations from UNPRUNED model (one full pass)
+        2. Prune all layers based on collected activations
+
+        This prevents error accumulation from pruned layers.
+        """
+        print("\n" + "="*50 + "\nWANDA PRUNING (Original Paper Method)\n" + "="*50)
+
         transformer_layers = self.get_transformer_layers()
         input_ids_list, attention_mask_list = self.prepare_calibration_inputs(calibration_data, n_samples)
 
         # ------------------------------------------------------------------
-        # STEP 1: FIND ROTARY EMBEDDING MODULE (CRITICAL)
+        # STEP 1: COLLECT ALL ACTIVATIONS (UNPRUNED MODEL)
         # ------------------------------------------------------------------
-        rotary_emb = None
-        
-        # Check Location 1: Model level (Llama-3 style)
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'rotary_emb'):
-            rotary_emb = self.model.model.rotary_emb
-        
-        # Check Location 2: First layer attention (Mistral/Llama-2 style)
-        elif hasattr(transformer_layers[0], 'self_attn') and hasattr(transformer_layers[0].self_attn, 'rotary_emb'):
-            rotary_emb = transformer_layers[0].self_attn.rotary_emb
-            
-        if rotary_emb is None:
-            raise ValueError(
-                "❌ CRITICAL ERROR: Could not find 'rotary_emb' module.\n"
-                "This script requires access to RoPE to calculate position embeddings manually.\n"
-                "Please check if 'transformer_layers[0].self_attn.rotary_emb' exists."
-            )
-        
-        print(f"✅ Found Rotary Embedding Module: {type(rotary_emb)}")
+        print("\nCollecting activations from unpruned model...")
+        all_activations = {}  # {layer_name: [activation tensors]}
+
+        def register_hooks_for_all_layers():
+            """Register hooks on ALL linear layers at once"""
+            hooks = []
+            for layer_idx, layer_module in enumerate(transformer_layers):
+                for sublayer_name, module in layer_module.named_modules():
+                    if isinstance(module, nn.Linear):
+                        full_name = f"layer_{layer_idx}.{sublayer_name}"
+
+                        def make_hook(name):
+                            def hook(m, inp, out):
+                                if isinstance(inp, tuple):
+                                    inp = inp[0]
+                                if name not in all_activations:
+                                    all_activations[name] = []
+                                # Store on CPU immediately to save VRAM
+                                all_activations[name].append(inp.detach().cpu().float().clone())
+                            return hook
+
+                        handle = module.register_forward_hook(make_hook(full_name))
+                        hooks.append(handle)
+            return hooks
+
+        # Register all hooks
+        hooks = register_hooks_for_all_layers()
+
+        # Run calibration samples through UNPRUNED model
+        print(f"Running {len(input_ids_list)} calibration samples through model...")
+        with torch.no_grad():
+            for idx, (input_ids, attention_mask) in enumerate(tqdm(zip(input_ids_list, attention_mask_list),
+                                                                     total=len(input_ids_list),
+                                                                     desc="Calibration")):
+                inputs = {
+                    'input_ids': input_ids.to(self.device),
+                    'attention_mask': attention_mask.to(self.device)
+                }
+                _ = self.model(**inputs)
+
+                # Aggressive cleanup every 10 samples
+                if (idx + 1) % 10 == 0:
+                    torch.cuda.empty_cache()
+
+        # Remove all hooks
+        for handle in hooks:
+            handle.remove()
+
+        print(f"✅ Collected activations for {len(all_activations)} linear layers")
 
         # ------------------------------------------------------------------
-        # STEP 2: PRE-COMPUTE EMBEDDINGS
+        # STEP 2: PRUNE ALL LAYERS
         # ------------------------------------------------------------------
-        print("Computing initial embeddings...")
-        embed_layer = self.model.model.embed_tokens
-        
-        embeddings_list = []
-        position_ids_list = []
-        
-        for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
-            # Embeddings
-            emb = embed_layer(input_ids.to(self.device)).detach().cpu()
-            embeddings_list.append(emb)
-            
-            # Position IDs (handling padding)
-            mask_dev = attention_mask.to(self.device)
-            pos_ids = mask_dev.long().cumsum(-1) - 1
-            pos_ids.masked_fill_(mask_dev == 0, 1)
-            position_ids_list.append(pos_ids.detach().cpu())
+        print("\nPruning layers based on collected activations...")
+        pruned_count = 0
 
-        # ------------------------------------------------------------------
-        # STEP 3: LAYER LOOP
-        # ------------------------------------------------------------------
-        for i, layer_module in enumerate(tqdm(transformer_layers, desc="Layers")):
-            all_linear_inputs = {}
-            next_layer_inputs = []
+        for layer_idx, layer_module in enumerate(tqdm(transformer_layers, desc="Pruning")):
+            for sublayer_name, module in layer_module.named_modules():
+                if isinstance(module, nn.Linear):
+                    full_name = f"layer_{layer_idx}.{sublayer_name}"
 
-            for hidden_states, attention_mask, pos_ids in zip(embeddings_list, attention_mask_list, position_ids_list):
+                    # Skip lm_head
+                    if "lm_head" in sublayer_name.lower():
+                        continue
 
-                # 1. Generate RoPE for this batch
-                # MistralRotaryEmbedding.forward(x, position_ids)
-                dummy = hidden_states.to(self.device)
-                pos_ids_dev = pos_ids.to(self.device)
+                    # Get activations for this layer
+                    if full_name in all_activations:
+                        self.activation_data[full_name] = all_activations[full_name]
 
-                with torch.no_grad():
-                    cos, sin = rotary_emb(dummy, pos_ids_dev)
-                    position_embeddings = (cos, sin)
-                
-                # 2. Run Layer
-                linear_inputs, output = self.get_layer_inputs(
-                    layer_module, 
-                    hidden_states, 
-                    attention_mask, 
-                    position_ids=pos_ids,
-                    position_embeddings=position_embeddings
-                )
+                        # Prune
+                        debug = (pruned_count < 2)
+                        self.prune_layer(full_name, module, debug=debug)
+                        pruned_count += 1
 
-                # Accumulate
-                for name, data in linear_inputs.items():
-                    if name not in all_linear_inputs: all_linear_inputs[name] = []
-                    all_linear_inputs[name].extend(data)
-                
-                next_layer_inputs.append(output.detach().cpu())
-                del dummy
+                        # Free memory
+                        del all_activations[full_name]
 
-            # 3. Prune this layer
-            for name, module in layer_module.named_modules():
-                if isinstance(module, nn.Linear) and "lm_head" not in name:
-                    self.activation_data[name] = all_linear_inputs.get(name, [])
-                    self.prune_layer(name, module)
-            
-            # Cleanup
-            embeddings_list = next_layer_inputs
-            self.activation_data = {}
+            # Cleanup after each layer
             torch.cuda.empty_cache()
             gc.collect()
+
+        print(f"✅ Pruned {pruned_count} layers")
+
+        # Final cleanup
+        self.activation_data = {}
+        all_activations.clear()
+        torch.cuda.empty_cache()
+        gc.collect()
 
         print("Pruning Complete.")
 
