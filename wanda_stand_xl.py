@@ -7,15 +7,17 @@ Key Features:
 - Uses L2 norm for activation salience
 - Scoring: Score_ij = |W_ij| * ||X_j||_2
 - Per-row (output channel) top-p% selection
-- Batched sequential processing for memory efficiency
+- Layer-by-layer processing with output propagation
 
-Algorithm:
-1. Compute per-input-channel salience: s[j] = ||X_j||_2 (L2 norm across all tokens)
-2. Score each weight: Score_ij = |W_ij| * s[j]
-3. For each output channel (row i):
+Algorithm (per layer):
+1. Run forward pass through current layer (unpruned) - capture inputs
+2. Compute per-input-channel salience: s[j] = ||X_j||_2 (L2 norm across all tokens)
+3. Score each weight: Score_ij = |W_ij| * s[j]
+4. For each output channel (row i):
    - Keep top p% highest scoring weights
    - Zero out the remaining weights
-4. Save pruned model
+5. Run forward pass through pruned layer - get outputs
+6. Outputs become inputs for next layer
 
 Special Handling:
 - lm_head layer is NOT pruned (keeps original weights)
@@ -186,154 +188,226 @@ class WandaPruner:
         if debug:
             print(f"  → Target sparsity: {self.sparsity*100:.1f}%, Actual: {actual_sparsity*100:.2f}%")
 
-    def calibrate_layer_batch(self, layer_names_batch, calibration_data, n_samples=500):
+    def get_transformer_layers(self):
         """
-        Calibrate a BATCH of layers simultaneously.
+        Get transformer layers in execution order.
+        Works for Llama, Mistral, and similar architectures.
         """
-        # Clear any previous activation data
-        self.activation_data = {}
+        # Try to find the transformer layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            # LlamaForCausalLM, MistralForCausalLM
+            return self.model.model.layers
+        elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+            # GPT-2, GPT-Neo
+            return self.model.transformer.h
+        elif hasattr(self.model, 'gpt_neox') and hasattr(self.model.gpt_neox, 'layers'):
+            # GPT-NeoX
+            return self.model.gpt_neox.layers
+        else:
+            raise ValueError("Could not find transformer layers. Model architecture not supported.")
 
-        # Register hooks for ALL layers in this batch
+    def prepare_calibration_inputs(self, calibration_data, n_samples=500):
+        """
+        Tokenize calibration data once and prepare inputs.
+        """
+        print(f"\nTokenizing {n_samples} calibration samples...")
+        input_ids_list = []
+        attention_mask_list = []
+
+        for i, text in enumerate(tqdm(calibration_data[:n_samples], desc="Tokenizing")):
+            try:
+                inputs = self.tokenizer(text, return_tensors="pt",
+                                       truncation=True, max_length=512)
+                input_ids_list.append(inputs['input_ids'])
+                attention_mask_list.append(inputs['attention_mask'])
+            except Exception as e:
+                if i == 0:
+                    print(f"\n⚠️  Tokenization error: {str(e)[:100]}")
+                continue
+
+        print(f"Successfully tokenized {len(input_ids_list)} samples")
+        return input_ids_list, attention_mask_list
+
+    def get_layer_inputs(self, layer_module, inputs, attention_mask, position_ids=None):
+        """
+        Run inputs through a transformer layer and capture the input to linear sublayers.
+        Returns the layer's inputs (for pruning) and outputs (for next layer).
+        """
+        # Storage for capturing inputs to linear layers
+        linear_inputs = {}
+
+        def capture_hook(name):
+            def hook(module, inp, output):
+                if isinstance(inp, tuple):
+                    inp_tensor = inp[0]
+                else:
+                    inp_tensor = inp
+                # Store on CPU
+                if name not in linear_inputs:
+                    linear_inputs[name] = []
+                linear_inputs[name].append(inp_tensor.detach().cpu().float().clone())
+            return hook
+
+        # Register hooks on all linear layers in this transformer layer
         handles = []
-        for name, module in layer_names_batch:
-            handle = module.register_forward_hook(self.get_hook(name))
-            handles.append((name, handle))
+        for name, module in layer_module.named_modules():
+            if isinstance(module, nn.Linear):
+                handle = module.register_forward_hook(capture_hook(name))
+                handles.append(handle)
 
-        # Run calibration data through model ONCE for all layers in batch
-        successful_passes = 0
+        # Run forward pass through this layer
         with torch.no_grad():
-            for i, text in enumerate(calibration_data[:n_samples]):
-                try:
-                    inputs = self.tokenizer(text, return_tensors="pt",
-                                           truncation=True, max_length=512)
-                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            if position_ids is not None:
+                outputs = layer_module(inputs, attention_mask=attention_mask, position_ids=position_ids)
+            else:
+                outputs = layer_module(inputs, attention_mask=attention_mask)
 
-                    _ = self.model(**inputs, use_cache=False, return_dict=True)
-                    successful_passes += 1
-                    del inputs
+            # Extract hidden states (first element of tuple for most models)
+            if isinstance(outputs, tuple):
+                layer_output = outputs[0]
+            else:
+                layer_output = outputs
 
-                    # Aggressive cleanup
-                    if (i + 1) % 10 == 0:
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        gc.collect()
-                except Exception as e:
-                    if i == 0:
-                        print(f"\n⚠️  Forward pass error: {str(e)[:100]}")
-                    continue
-
-        # Remove all hooks
-        for name, handle in handles:
+        # Remove hooks
+        for handle in handles:
             handle.remove()
 
-        if successful_passes == 0:
-            print(f"\n❌ FATAL: No successful forward passes for batch!")
+        return linear_inputs, layer_output
 
-        # Verify activations were captured
-        for name, _ in layer_names_batch:
-            if name not in self.activation_data:
-                # Some layers might not be called in every pass (rare for Linear)
-                self.activation_data[name] = []
-
-    def get_hook(self, name):
-        """Create a hook function for a specific layer."""
-        def hook(_module, input, _output):
-            if name not in self.activation_data:
-                self.activation_data[name] = []
-            if isinstance(input, tuple):
-                inp = input[0]
-            else:
-                inp = input
-
-            # Subsample tokens if sequence is too long
-            if inp.dim() == 3 and inp.shape[1] > self.max_tokens_per_sample:
-                seq_len = inp.shape[1]
-                # Random subsample is better for coverage
-                indices = torch.randperm(seq_len, device=inp.device)[:self.max_tokens_per_sample]
-                indices = indices.sort()[0]
-                inp = inp[:, indices, :]
-
-            # Store activation on CPU (use float32 for numerical stability in L2 norm computation)
-            inp_stored = inp.detach().cpu().float().clone()
-            self.activation_data[name].append(inp_stored)
-            del inp
-        return hook
-
-    def prune_model_sequential(self, calibration_data, n_samples=500, layer_batch_size=16):
+    def prune_model_sequential(self, calibration_data, n_samples=500):
         """
-        BATCHED SEQUENTIAL PRUNING with special handling for lm_head.
+        LAYER-BY-LAYER SEQUENTIAL PRUNING with output propagation.
+
+        Flow for each layer:
+        1. Run forward pass through current layer (unpruned) - capture inputs
+        2. Prune linear sublayers based on input activations
+        3. Run forward pass through pruned layer - get outputs
+        4. Outputs become inputs for next layer
         """
         print("\n" + "=" * 80)
-        print("BATCHED SEQUENTIAL PRUNING (XL Version)")
+        print("LAYER-BY-LAYER SEQUENTIAL PRUNING (XL Version)")
         print("=" * 80)
 
         if HAS_PSUTIL:
             initial_ram = psutil.virtual_memory().percent
             print(f"Initial System RAM: {initial_ram:.1f}%")
 
-        layer_names = [(name, module) for name, module in self.model.named_modules()
-                       if isinstance(module, nn.Linear)]
+        # Get transformer layers in execution order
+        try:
+            transformer_layers = self.get_transformer_layers()
+            print(f"\nFound {len(transformer_layers)} transformer layers")
+        except ValueError as e:
+            print(f"\n❌ Error: {e}")
+            return
 
-        print(f"\nFound {len(layer_names)} linear layers to prune")
-        print(f"Batch size: {layer_batch_size} layers per batch")
-        num_batches = (len(layer_names) + layer_batch_size - 1) // layer_batch_size
-        print(f"Total batches: {num_batches}")
+        # Prepare calibration inputs (tokenize once)
+        input_ids_list, attention_mask_list = self.prepare_calibration_inputs(calibration_data, n_samples)
 
+        if len(input_ids_list) == 0:
+            print("\n❌ No valid calibration samples!")
+            return
+
+        # Get embeddings for all samples
+        print("\nComputing embeddings...")
+        with torch.no_grad():
+            # Get embedding layer
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                embed_layer = self.model.model.embed_tokens
+            elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'wte'):
+                embed_layer = self.model.transformer.wte
+            else:
+                print("❌ Could not find embedding layer")
+                return
+
+            # Compute embeddings for all samples
+            embeddings_list = []
+            for input_ids in tqdm(input_ids_list, desc="Embedding"):
+                input_ids_device = input_ids.to(self.device)
+                emb = embed_layer(input_ids_device)
+                embeddings_list.append(emb)
+                del input_ids_device
+
+        print(f"Embeddings computed for {len(embeddings_list)} samples")
+
+        # Process each transformer layer sequentially
         pruned_count = 0
         skipped_count = 0
 
-        # Process layers in batches
-        for batch_idx in range(num_batches):
-            batch_start = batch_idx * layer_batch_size
-            batch_end = min(batch_start + layer_batch_size, len(layer_names))
-            batch_layers = layer_names[batch_start:batch_end]
-
+        for layer_idx, layer_module in enumerate(tqdm(transformer_layers, desc="Pruning Layers")):
             print(f"\n{'='*60}")
-            print(f"Batch {batch_idx + 1}/{num_batches}: Layers {batch_start}-{batch_end-1}")
+            print(f"Layer {layer_idx}/{len(transformer_layers)-1}")
             print(f"{'='*60}")
 
-            # STEP 1: Calibrate this BATCH
-            self.calibrate_layer_batch(batch_layers, calibration_data, n_samples)
+            # Collect inputs for all calibration samples through this layer
+            all_linear_inputs = {}
+            next_layer_inputs = []
 
-            # STEP 2: Prune each layer in the batch
-            for _, (name, module) in enumerate(tqdm(batch_layers, desc=f"Pruning Batch {batch_idx+1}")):
-                try:
-                    # Check if this is lm_head (skip pruning to preserve output quality)
-                    is_lmhead = 'lm_head' in name.lower() or name.endswith('lm_head')
+            for sample_idx, (hidden_states, attention_mask) in enumerate(zip(embeddings_list, attention_mask_list)):
+                # Run layer forward pass and capture linear layer inputs
+                attention_mask_device = attention_mask.to(self.device)
+                linear_inputs, layer_output = self.get_layer_inputs(
+                    layer_module, hidden_states, attention_mask_device
+                )
 
-                    if is_lmhead:
-                        # Skip lm_head pruning - keep original weights
-                        print(f"\n  ⏭️  Skipping {name} (keeping original weights)")
-                        skipped_count += 1
-                    else:
-                        # Standard processing for other layers
-                        # Debug output for first few layers
-                        if pruned_count < 2:
-                            print(f"\nDEBUG Layer {pruned_count}: {name}")
-                            self.prune_layer(name, module, debug=True)
-                        else:
-                            self.prune_layer(name, module)
+                # Accumulate inputs for each linear sublayer
+                for sublayer_name, inp_list in linear_inputs.items():
+                    if sublayer_name not in all_linear_inputs:
+                        all_linear_inputs[sublayer_name] = []
+                    all_linear_inputs[sublayer_name].extend(inp_list)
 
-                        pruned_count += 1
+                # Store output for next layer
+                next_layer_inputs.append(layer_output.detach())
 
-                except Exception as e:
-                    print(f"\n⚠️  Error pruning {name}: {e}")
+                # Cleanup
+                del attention_mask_device, layer_output
+                if (sample_idx + 1) % 10 == 0:
+                    torch.cuda.empty_cache()
+
+            # Prune each linear sublayer in this transformer layer
+            for sublayer_name, module in layer_module.named_modules():
+                if not isinstance(module, nn.Linear):
+                    continue
+
+                # Check if this is lm_head (skip - but lm_head shouldn't be in transformer layers)
+                is_lmhead = 'lm_head' in sublayer_name.lower()
+                if is_lmhead:
+                    print(f"  ⏭️  Skipping {sublayer_name} (keeping original weights)")
                     skipped_count += 1
                     continue
 
-            # STEP 3: Clear activations
+                # Get activations for this sublayer
+                if sublayer_name in all_linear_inputs:
+                    self.activation_data[sublayer_name] = all_linear_inputs[sublayer_name]
+
+                    # Prune this sublayer
+                    debug = (pruned_count < 2)
+                    if debug:
+                        print(f"\n  DEBUG Sublayer: {sublayer_name}")
+                    self.prune_layer(sublayer_name, module, debug=debug)
+                    pruned_count += 1
+
+            # Update embeddings_list with outputs from this layer for next iteration
+            embeddings_list = next_layer_inputs
+
+            # Cleanup
             self.activation_data = {}
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
             gc.collect()
 
             if HAS_PSUTIL:
                 ram_pct = psutil.virtual_memory().percent
-                print(f"Batch {batch_idx+1} complete. RAM: {ram_pct:.1f}%")
+                print(f"Layer {layer_idx} complete. RAM: {ram_pct:.1f}%")
+
+        # Handle lm_head separately (skip pruning)
+        print(f"\n{'='*60}")
+        print("Final Layer: lm_head")
+        print(f"{'='*60}")
+        print("  ⏭️  Skipping lm_head (keeping original weights)")
+        skipped_count += 1
 
         print(f"\n✅ Sequential Pruning Complete!")
-        print(f"   Total layers pruned: {pruned_count}/{len(layer_names)}")
-        print(f"   Skipped layers (lm_head, etc.): {skipped_count}")
+        print(f"   Total layers pruned: {pruned_count}")
+        print(f"   Skipped layers: {skipped_count}")
 
         if self.layer_stats:
             sparsities = [info['actual_sparsity'] for info in self.layer_stats.values()]
@@ -374,9 +448,6 @@ def main():
     parser.add_argument("--calib-dataset", type=str, default="c4",
                        choices=["c4", "wikitext2", "wikitext2-simple"],
                        help="Calibration dataset")
-    parser.add_argument("--layer-batch-size", type=int, default=16,
-                       help="Number of layers to calibrate simultaneously. "
-                            "XL models require smaller batches due to larger hidden dim.")
     parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
                        help="Directory to cache calibration data (default: ./calibration_cache)")
     args = parser.parse_args()
@@ -398,7 +469,7 @@ def main():
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Target Sparsity: {args.sparsity*100:.1f}%")
-    print(f"Layer Batch Size: {args.layer_batch_size}")
+    print(f"Processing: Layer-by-layer with output propagation")
     print(f"Special: lm_head is NOT pruned (keeps original weights)")
     print("=" * 80)
 
@@ -437,9 +508,8 @@ def main():
         max_tokens_per_sample=args.max_tokens_per_sample
     )
 
-    # Batched sequential pruning
-    pruner.prune_model_sequential(calib_texts, n_samples=args.n_calib,
-                                  layer_batch_size=args.layer_batch_size)
+    # Layer-by-layer sequential pruning
+    pruner.prune_model_sequential(calib_texts, n_samples=args.n_calib)
 
     # Save model
     print(f"\nSaving pruned model to {args.output_dir}...")
