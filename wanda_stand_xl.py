@@ -228,7 +228,7 @@ class WandaPruner:
         print(f"Successfully tokenized {len(input_ids_list)} samples")
         return input_ids_list, attention_mask_list
 
-    def get_layer_inputs(self, layer_module, inputs, attention_mask, position_ids=None):
+    def get_layer_inputs(self, layer_module, inputs, attention_mask, position_ids=None, position_embeddings=None):
         """
         Run inputs through a transformer layer and capture the input to linear sublayers.
         Returns the layer's inputs (for pruning) and outputs (for next layer).
@@ -257,9 +257,18 @@ class WandaPruner:
 
         # Run forward pass through this layer
         with torch.no_grad():
-            if position_ids is not None:
-                outputs = layer_module(inputs, attention_mask=attention_mask, position_ids=position_ids)
-            else:
+            # Try different argument combinations based on model architecture
+            try:
+                # For Mistral/Llama with RoPE
+                if position_embeddings is not None:
+                    outputs = layer_module(inputs, attention_mask=attention_mask, position_embeddings=position_embeddings)
+                elif position_ids is not None:
+                    outputs = layer_module(inputs, attention_mask=attention_mask, position_ids=position_ids)
+                else:
+                    outputs = layer_module(inputs, attention_mask=attention_mask)
+            except TypeError as e:
+                # Fallback: try without position args
+                print(f"Warning: Error with position args ({e}), trying without...")
                 outputs = layer_module(inputs, attention_mask=attention_mask)
 
             # Extract hidden states (first element of tuple for most models)
@@ -307,35 +316,52 @@ class WandaPruner:
             print("\n❌ No valid calibration samples!")
             return
 
-        # Get embeddings and position_ids for all samples
-        print("\nComputing embeddings and position_ids...")
+        # Get embeddings and position embeddings for all samples
+        print("\nComputing embeddings and position embeddings...")
         with torch.no_grad():
             # Get embedding layer
             if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
                 embed_layer = self.model.model.embed_tokens
+                # Try to get rotary embedding layer for Mistral/Llama
+                try:
+                    rotary_emb = transformer_layers[0].self_attn.rotary_emb
+                    use_rope = True
+                except:
+                    rotary_emb = None
+                    use_rope = False
             elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'wte'):
                 embed_layer = self.model.transformer.wte
+                rotary_emb = None
+                use_rope = False
             else:
                 print("❌ Could not find embedding layer")
                 return
 
-            # Compute embeddings and position_ids for all samples
+            # Compute embeddings and position embeddings for all samples
             embeddings_list = []
-            position_ids_list = []
+            position_embeddings_list = []
             for input_ids, attention_mask in tqdm(zip(input_ids_list, attention_mask_list),
                                                    desc="Embedding", total=len(input_ids_list)):
                 input_ids_device = input_ids.to(self.device)
                 emb = embed_layer(input_ids_device)
                 embeddings_list.append(emb)
 
-                # Create position_ids from attention_mask
-                # position_ids = cumsum(attention_mask) - 1
-                attention_mask_device = attention_mask.to(self.device)
-                position_ids = attention_mask_device.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask_device == 0, 0)
-                position_ids_list.append(position_ids)
+                # Compute position embeddings if using RoPE
+                if use_rope and rotary_emb is not None:
+                    attention_mask_device = attention_mask.to(self.device)
+                    position_ids = attention_mask_device.long().cumsum(-1) - 1
+                    position_ids.masked_fill_(attention_mask_device == 0, 0)
 
-                del input_ids_device, attention_mask_device
+                    # Compute cos/sin position embeddings
+                    seq_len = input_ids.shape[1]
+                    position_embeddings = rotary_emb(emb, position_ids)
+                    position_embeddings_list.append(position_embeddings)
+
+                    del attention_mask_device, position_ids
+                else:
+                    position_embeddings_list.append(None)
+
+                del input_ids_device
 
         print(f"Embeddings computed for {len(embeddings_list)} samples")
 
@@ -352,13 +378,13 @@ class WandaPruner:
             all_linear_inputs = {}
             next_layer_inputs = []
 
-            for sample_idx, (hidden_states, attention_mask, position_ids) in enumerate(
-                zip(embeddings_list, attention_mask_list, position_ids_list)):
+            for sample_idx, (hidden_states, attention_mask, position_embeddings) in enumerate(
+                zip(embeddings_list, attention_mask_list, position_embeddings_list)):
                 # Run layer forward pass and capture linear layer inputs
                 attention_mask_device = attention_mask.to(self.device)
-                position_ids_device = position_ids.to(self.device)
                 linear_inputs, layer_output = self.get_layer_inputs(
-                    layer_module, hidden_states, attention_mask_device, position_ids_device
+                    layer_module, hidden_states, attention_mask_device,
+                    position_ids=None, position_embeddings=position_embeddings
                 )
 
                 # Accumulate inputs for each linear sublayer
@@ -371,7 +397,7 @@ class WandaPruner:
                 next_layer_inputs.append(layer_output.detach())
 
                 # Cleanup
-                del attention_mask_device, position_ids_device, layer_output
+                del attention_mask_device, layer_output
                 if (sample_idx + 1) % 10 == 0:
                     torch.cuda.empty_cache()
 
