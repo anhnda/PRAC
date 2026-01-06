@@ -262,9 +262,9 @@ class WandaPruner:
             inputs = inputs.to(self.device)
             if attention_mask is not None:
                 attention_mask = attention_mask.to(self.device)
-                # Ensure correct dtype (float or bool, not long)
-                if attention_mask.dtype == torch.long:
-                    attention_mask = attention_mask.float()
+                # Convert to match model dtype (bfloat16)
+                if attention_mask.dtype != inputs.dtype:
+                    attention_mask = attention_mask.to(inputs.dtype)
             if position_ids is not None:
                 position_ids = position_ids.to(self.device)
 
