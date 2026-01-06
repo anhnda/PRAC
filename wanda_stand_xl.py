@@ -221,15 +221,14 @@ class WandaPruner:
             next_layer_inputs = []
 
             for hidden_states, attention_mask, pos_ids in zip(embeddings_list, attention_mask_list, position_ids_list):
-                
+
                 # 1. Generate RoPE for this batch
-                # MistralRotaryEmbedding expects (x, seq_len)
-                seq_len = hidden_states.shape[1]
-                
-                # Create dummy tensor on device to generate cos/sin
+                # MistralRotaryEmbedding.forward(x, position_ids)
                 dummy = hidden_states.to(self.device)
+                pos_ids_dev = pos_ids.to(self.device)
+
                 with torch.no_grad():
-                    cos, sin = rotary_emb(dummy, seq_len=seq_len)
+                    cos, sin = rotary_emb(dummy, pos_ids_dev)
                     position_embeddings = (cos, sin)
                 
                 # 2. Run Layer
