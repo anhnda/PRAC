@@ -232,7 +232,7 @@ class WandaPruner:
     def get_layer_inputs(self, layer_module, inputs, attention_mask, position_ids=None, position_embeddings=None):
         """
         Run inputs through a transformer layer and capture the input to linear sublayers.
-        Returns the layer's inputs (for pruning) and outputs (for next layer).
+        FIXED: Ensures position_ids are passed even when position_embeddings are present.
         """
         # Storage for capturing inputs to linear layers
         linear_inputs = {}
@@ -243,57 +243,57 @@ class WandaPruner:
                     inp_tensor = inp[0]
                 else:
                     inp_tensor = inp
-                # Store on CPU
                 if name not in linear_inputs:
                     linear_inputs[name] = []
+                # Store on CPU to save VRAM
                 linear_inputs[name].append(inp_tensor.detach().cpu().float().clone())
             return hook
 
-        # Register hooks on all linear layers in this transformer layer
+        # Register hooks
         handles = []
         for name, module in layer_module.named_modules():
             if isinstance(module, nn.Linear):
                 handle = module.register_forward_hook(capture_hook(name))
                 handles.append(handle)
 
-        # Run forward pass through this layer
+        # Move args to device
+        inputs = inputs.to(self.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+            if attention_mask.dtype != inputs.dtype:
+                attention_mask = attention_mask.to(inputs.dtype)
+        if position_ids is not None:
+            position_ids = position_ids.to(self.device)
+        if position_embeddings is not None:
+            # Ensure tuple elements are on device
+            cos, sin = position_embeddings
+            position_embeddings = (cos.to(self.device), sin.to(self.device))
+
+        # Run forward pass
         with torch.no_grad():
-            # Ensure all inputs are on the same device and have correct dtype
-            inputs = inputs.to(self.device)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(self.device)
-                # Convert to match model dtype (bfloat16)
-                if attention_mask.dtype != inputs.dtype:
-                    attention_mask = attention_mask.to(inputs.dtype)
+            # Build kwargs dynamically to ensure we pass everything needed
+            kwargs = {'attention_mask': attention_mask}
+
             if position_ids is not None:
-                position_ids = position_ids.to(self.device)
+                kwargs['position_ids'] = position_ids
 
-            # Prepare arguments based on what's available
             if position_embeddings is not None:
-                # For Mistral/Llama that need pre-computed position_embeddings
-                outputs = layer_module(
-                    inputs,
-                    attention_mask=attention_mask,
-                    position_embeddings=position_embeddings
-                )
-            elif position_ids is not None:
-                # For models that compute embeddings internally from position_ids
-                outputs = layer_module(
-                    inputs,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids
-                )
-            else:
-                # Fallback
-                outputs = layer_module(inputs, attention_mask=attention_mask)
+                kwargs['position_embeddings'] = position_embeddings
 
-            # Extract hidden states (first element of tuple for most models)
+            try:
+                outputs = layer_module(inputs, **kwargs)
+            except TypeError:
+                # Fallback: remove position_embeddings if model doesn't support explicit passing
+                if 'position_embeddings' in kwargs:
+                    del kwargs['position_embeddings']
+                outputs = layer_module(inputs, **kwargs)
+
             if isinstance(outputs, tuple):
                 layer_output = outputs[0]
             else:
                 layer_output = outputs
 
-        # Remove hooks
+        # Cleanup hooks
         for handle in handles:
             handle.remove()
 
@@ -397,16 +397,21 @@ class WandaPruner:
                 pos_ids = pos_ids.to(self.device)
 
                 # Compute position_embeddings for this sample if RoPE is available
+                position_embeddings = None
                 if rotary_emb is not None:
-                    # Compute cos/sin embeddings
-                    position_embeddings = rotary_emb(hidden_states, pos_ids)
-                else:
-                    position_embeddings = None
+                    # FIX: MistralRotaryEmbedding expects (x, seq_len)
+                    # We pass hidden_states so it can infer device/dtype
+                    seq_len = hidden_states.shape[1]
+                    try:
+                        cos, sin = rotary_emb(hidden_states, seq_len=seq_len)
+                        position_embeddings = (cos, sin)
+                    except Exception as e:
+                        print(f"⚠️ RoPE Error: {e}")
 
                 # Run layer forward pass and capture linear layer inputs
                 linear_inputs, layer_output = self.get_layer_inputs(
                     layer_module, hidden_states, attention_mask,
-                    position_ids=pos_ids,
+                    position_ids=pos_ids,  # FIX: We now ensure this is passed down!
                     position_embeddings=position_embeddings
                 )
 
