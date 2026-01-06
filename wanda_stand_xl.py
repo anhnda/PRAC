@@ -262,29 +262,105 @@ class WandaPruner:
             gc.collect()
 
         print("Pruning Complete.")
-        
-        # Save
-        os.makedirs("pruned_model", exist_ok=True)
-        self.model.save_pretrained("pruned_model")
-        self.tokenizer.save_pretrained("pruned_model")
+
+def load_wikitext2_simple(n_samples=128):
+    from datasets import load_dataset
+    print(f"Loading WikiText-2 (simple/fast approach)...")
+    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+    texts = [item['text'] for item in dataset if len(item['text'].strip()) > 0]
+    return texts[:n_samples]
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="./models/Mistral-7B-v0.3")
+    parser = argparse.ArgumentParser(
+        description="Wanda Pruning with L2 Norm Salience for XL Models",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
+    parser.add_argument("--sparsity", type=float, default=0.5,
+                       help="Target sparsity (0.5 = prune 50%% of weights)")
+    parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
+                       help="Max tokens to store per sample. Lower this if OOM.")
+    parser.add_argument("--output-dir", type=str, default="./pruned_models/model_wanda_xl",
+                       help="Output directory")
+    parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
+                       help="Model name or local path")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--calib-dataset", type=str, default="c4",
+                       choices=["c4", "wikitext2", "wikitext2-simple"],
+                       help="Calibration dataset")
+    parser.add_argument("--cache-dir", type=str, default="./calibration_cache",
+                       help="Directory to cache calibration data (default: ./calibration_cache)")
     args = parser.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    tokenizer.pad_token = tokenizer.eos_token
-    
+    # Set random seeds
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # Use model path from args
+    model_name = args.model_path
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("=" * 80)
+    print("Wanda Pruning with L2 Norm Salience (XL Version)")
+    print(f"Target Model: {model_name}")
+    print("=" * 80)
+    print(f"Device: {device}")
+    print(f"Target Sparsity: {args.sparsity*100:.1f}%")
+    print(f"Processing: Layer-by-layer with output propagation")
+    print(f"Special: lm_head is NOT pruned (keeps original weights)")
+    print("=" * 80)
+
+    # Load model and tokenizer
+    print("\nLoading model and tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    # Mistral/Llama fix: Ensure pad_token is set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        print("  -> Set pad_token = eos_token")
+
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, 
-        torch_dtype=torch.bfloat16, 
-        device_map="auto"
+        model_name,
+        torch_dtype=torch.bfloat16,  # Use bfloat16 for better numerical stability
+        device_map="auto",
+        trust_remote_code=True
+    )
+    model.eval()
+
+    # Load calibration data
+    print(f"\nLoading calibration dataset: {args.calib_dataset}")
+    if args.calib_dataset == "c4":
+        calib_texts = get_c4_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed, cache_dir=args.cache_dir)
+    elif args.calib_dataset == "wikitext2-simple":
+        calib_texts = load_wikitext2_simple(n_samples=args.n_calib)
+    else:
+        calib_texts = get_wikitext2_calibration_data(tokenizer, n_samples=args.n_calib, seqlen=2048, seed=args.seed, cache_dir=args.cache_dir)
+
+    # Initialize pruner
+    pruner = WandaPruner(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        sparsity=args.sparsity,
+        max_tokens_per_sample=args.max_tokens_per_sample
     )
 
-    pruner = WandaPruner(model, tokenizer)
-    texts = get_c4_calibration_data(tokenizer, n_samples=128, seqlen=2048)
-    pruner.prune_model_sequential(texts, n_samples=128)
+    # Layer-by-layer sequential pruning
+    pruner.prune_model_sequential(calib_texts, n_samples=args.n_calib)
+
+    # Save model
+    print(f"\nSaving pruned model to {args.output_dir}...")
+    os.makedirs(args.output_dir, exist_ok=True)
+    model.save_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+
+    print("\n" + "=" * 80)
+    print("PRUNING COMPLETE!")
+    print("=" * 80)
+
 
 if __name__ == "__main__":
     main()
