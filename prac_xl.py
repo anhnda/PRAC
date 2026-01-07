@@ -145,8 +145,9 @@ class WandaPrunerWithCorrection:
         self.percent_change = percent_change
         self.max_correction_magnitude = max_correction_magnitude
 
-        # Storage
-        self.activation_data = {}
+        # Storage - use incremental statistics instead of storing all activations
+        # Memory: O(hidden_dim) instead of O(samples × hidden_dim)
+        self.activation_stats = {}  # Dict of {name: {'l2_sum': tensor, 'mean_sum': tensor, 'count': int}}
         self.hooks = []
         self.layer_stats = {}
 
@@ -155,6 +156,7 @@ class WandaPrunerWithCorrection:
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample")
         print(f"  Salience metric: ||X_j||_2 (L2 norm)")
         print(f"  Scoring: Score_ij = |W_ij| * ||X_j||_2")
+        print(f"  Memory optimization: Incremental statistics (no activation storage)")
         if use_correction:
             print(f"  Moderate correction: ENABLED")
             print(f"    - Correction percent: {percent_change*100:.1f}% of weights")
@@ -168,29 +170,25 @@ class WandaPrunerWithCorrection:
     @torch.no_grad()
     def get_activation_stats(self, name):
         """
-        Compute L2 salience and James-Stein mean using float32 precision.
+        Compute L2 salience and James-Stein mean from pre-accumulated statistics.
+
+        Memory efficient: Uses O(hidden_dim) instead of O(samples × hidden_dim).
 
         Returns:
             tuple: (l2_salience, js_mean, raw_mean)
         """
-        if name not in self.activation_data or len(self.activation_data[name]) == 0:
+        if name not in self.activation_stats:
             return None, None, None
 
-        X_list = self.activation_data[name]
-        total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
-        in_features = X_list[0].shape[-1]
+        stats = self.activation_stats[name]
 
-        # Use float32 for accumulation
-        l2_sum = torch.zeros(in_features, dtype=torch.float32)
-        mean_sum = torch.zeros(in_features, dtype=torch.float32)
+        # Check if we have any data
+        if stats['count'] == 0:
+            return None, None, None
 
-        for x in X_list:
-            x_flat = x.reshape(-1, x.shape[-1]).float()
-            l2_sum += x_flat.pow(2).sum(dim=0)
-            mean_sum += x_flat.sum(dim=0)
-
-        l2_salience = torch.sqrt(l2_sum / total_samples)
-        raw_mean = mean_sum / total_samples
+        # Compute statistics from accumulated sums
+        l2_salience = torch.sqrt(stats['l2_sum'] / stats['count'])
+        raw_mean = stats['mean_sum'] / stats['count']
 
         # Apply James-Stein estimator
         js_mean = compute_james_stein_mean(raw_mean)
@@ -386,8 +384,8 @@ class WandaPrunerWithCorrection:
         """
         Prune layer with optional moderate weight correction.
         """
-        if name not in self.activation_data or len(self.activation_data[name]) == 0:
-            print(f"  ⚠️  No activation data for {name}, skipping")
+        if name not in self.activation_stats:
+            print(f"  ⚠️  No activation stats for {name}, skipping")
             return
 
         # Get activation statistics
@@ -456,10 +454,13 @@ class WandaPrunerWithCorrection:
         torch.cuda.empty_cache()
 
     def get_hook(self, name):
-        """Create hook for activation capture."""
+        """
+        Create hook for incremental activation statistics.
+
+        Instead of storing all activations (O(samples × hidden_dim) memory),
+        we accumulate running statistics (O(hidden_dim) memory).
+        """
         def hook(module, input, output):
-            if name not in self.activation_data:
-                self.activation_data[name] = []
             if isinstance(input, tuple):
                 inp = input[0]
             else:
@@ -472,13 +473,43 @@ class WandaPrunerWithCorrection:
                 indices = indices.sort()[0]
                 inp = inp[:, indices, :]
 
-            # Store on CPU as float32
-            self.activation_data[name].append(inp.detach().cpu().float())
+            # Flatten to [num_tokens, hidden_dim]
+            inp_flat = inp.reshape(-1, inp.shape[-1])
+            num_tokens = inp_flat.shape[0]
+            hidden_dim = inp_flat.shape[1]
+
+            # Convert to float32 for numerical stability
+            inp_flat = inp_flat.detach().float()
+
+            # Initialize statistics storage if needed
+            if name not in self.activation_stats:
+                self.activation_stats[name] = {
+                    'l2_sum': torch.zeros(hidden_dim, dtype=torch.float32),
+                    'mean_sum': torch.zeros(hidden_dim, dtype=torch.float32),
+                    'count': 0
+                }
+
+            # Update running statistics on CPU (to avoid GPU memory pressure)
+            stats = self.activation_stats[name]
+            stats['l2_sum'] += inp_flat.pow(2).sum(dim=0).cpu()
+            stats['mean_sum'] += inp_flat.sum(dim=0).cpu()
+            stats['count'] += num_tokens
+
+            # No need to store inp - we've extracted what we need!
+            del inp_flat
+
         return hook
 
     def calibrate_layer_batch(self, layer_names_batch, calibration_data, n_samples=500):
-        """Calibrate batch of layers."""
-        self.activation_data = {}
+        """
+        Calibrate batch of layers using incremental statistics.
+
+        Memory efficient: Accumulates statistics instead of storing activations.
+        """
+        # Clear previous statistics for this batch
+        for name, _ in layer_names_batch:
+            if name in self.activation_stats:
+                del self.activation_stats[name]
 
         handles = []
         for name, module in layer_names_batch:
@@ -509,9 +540,16 @@ class WandaPrunerWithCorrection:
         if successful == 0:
             print(f"\n❌ FATAL: No successful forward passes!")
 
+        # Verify all layers got some data
         for name, _ in layer_names_batch:
-            if name not in self.activation_data:
-                self.activation_data[name] = []
+            if name not in self.activation_stats:
+                # Initialize with zeros if no data
+                print(f"  ⚠️ No activations captured for {name}")
+                self.activation_stats[name] = {
+                    'l2_sum': None,
+                    'mean_sum': None,
+                    'count': 0
+                }
 
     def prune_model_sequential(self, calibration_data, n_samples=500, layer_batch_size=16):
         """Batched sequential pruning with correction."""
@@ -564,8 +602,11 @@ class WandaPrunerWithCorrection:
                     skipped_count += 1
                     continue
 
-            # Cleanup
-            self.activation_data = {}
+            # Cleanup - clear statistics for this batch
+            for name, _ in batch_layers:
+                if name in self.activation_stats:
+                    del self.activation_stats[name]
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
@@ -605,7 +646,7 @@ class WandaPrunerWithCorrection:
                     print(f"  Mean clamp %: {np.mean(clamp_pcts):.1f}% (range: {np.min(clamp_pcts):.1f}% - {np.max(clamp_pcts):.1f}%)")
 
         # Final cleanup
-        self.activation_data = {}
+        self.activation_stats = {}
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
