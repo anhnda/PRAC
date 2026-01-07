@@ -132,7 +132,8 @@ class WandaPrunerWithCorrection:
 
     def __init__(self, model, tokenizer, device="cuda", sparsity=0.5,
                  max_tokens_per_sample=512, use_correction=True,
-                 knee_tolerance=0.0, offset_percent=0.0, percent_change=0.05):
+                 knee_tolerance=0.0, offset_percent=0.0, percent_change=0.05,
+                 max_correction_magnitude=0.05):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -142,6 +143,7 @@ class WandaPrunerWithCorrection:
         self.knee_tolerance = knee_tolerance
         self.offset_percent = offset_percent
         self.percent_change = percent_change
+        self.max_correction_magnitude = max_correction_magnitude
 
         # Storage
         self.activation_data = {}
@@ -156,6 +158,7 @@ class WandaPrunerWithCorrection:
         if use_correction:
             print(f"  Moderate correction: ENABLED")
             print(f"    - Correction percent: {percent_change*100:.1f}% of weights")
+            print(f"    - Max magnitude: {max_correction_magnitude*100:.1f}% of original weight")
             print(f"    - Knee tolerance: {knee_tolerance}")
             print(f"    - Offset percent: {offset_percent*100:.1f}%")
         else:
@@ -300,12 +303,29 @@ class WandaPrunerWithCorrection:
         # Vectorized correction
         W_corrected = W_pruned_f32.clone()
 
+        # Track clamping statistics
+        num_clamped = 0
+        total_corrections = 0
+
         # For each moderate position j:
         # delta_W[:,j] = -errors * sign(js_mean[j]) / sum_abs_js_mean
+        # Constrain: |delta_W[i,j]| <= max_correction_magnitude * |W_orig[i,j]|
         for j in selected_positions:
             sign_val = torch.sign(js_mean_f32[j])
             delta_W_j = -errors * sign_val / sum_abs_js_mean
-            W_corrected[:, j] += delta_W_j
+
+            # Compute magnitude constraint: max 5% of original weight magnitude
+            max_change = self.max_correction_magnitude * W_orig_f32[:, j].abs()
+
+            # Clamp delta to constraint
+            delta_W_j_clamped = torch.clamp(delta_W_j, -max_change, max_change)
+
+            # Track how many were clamped
+            was_clamped = (delta_W_j.abs() > max_change).sum().item()
+            num_clamped += was_clamped
+            total_corrections += len(delta_W_j)
+
+            W_corrected[:, j] += delta_W_j_clamped
 
         # Convert back to original dtype
         W_corrected = W_corrected.to(weight_dtype)
@@ -319,12 +339,16 @@ class WandaPrunerWithCorrection:
             'error_after_mean': errors_after.abs().mean().item(),
             'error_reduction_mean': error_reduction,
             'num_corrected_positions': len(selected_positions),
+            'num_clamped': num_clamped,
+            'total_corrections': total_corrections,
+            'clamp_percentage': num_clamped / total_corrections * 100 if total_corrections > 0 else 0,
         }
 
         if debug:
             print(f"    Error before: {correction_stats['error_before_mean']:.6f}")
             print(f"    Error after: {correction_stats['error_after_mean']:.6f}")
             print(f"    Reduction: {error_reduction:.6f}")
+            print(f"    Clamped: {num_clamped}/{total_corrections} ({correction_stats['clamp_percentage']:.1f}%)")
 
         return W_corrected, correction_stats
 
@@ -571,11 +595,14 @@ class WandaPrunerWithCorrection:
                                    for k in corrected_layers]
                     reductions = [self.layer_stats[k]['correction_stats']['error_reduction_mean']
                                  for k in corrected_layers]
+                    clamp_pcts = [self.layer_stats[k]['correction_stats']['clamp_percentage']
+                                 for k in corrected_layers]
 
                     print(f"\nModerate correction statistics ({len(corrected_layers)} layers):")
                     print(f"  Mean error before: {np.mean(errors_before):.6f}")
                     print(f"  Mean error after: {np.mean(errors_after):.6f}")
                     print(f"  Mean reduction: {np.mean(reductions):.6f}")
+                    print(f"  Mean clamp %: {np.mean(clamp_pcts):.1f}% (range: {np.min(clamp_pcts):.1f}% - {np.max(clamp_pcts):.1f}%)")
 
         # Final cleanup
         self.activation_data = {}
@@ -611,6 +638,8 @@ def main():
                        help="Offset from knee point (as fraction)")
     parser.add_argument("--percent-change", type=float, default=0.05,
                        help="Percentage of weights to correct (default 5%%)")
+    parser.add_argument("--max-correction-magnitude", type=float, default=0.05,
+                       help="Max correction magnitude as fraction of original weight (default 5%%)")
     parser.add_argument("--output-dir", type=str, default="./pruned_models/model_prac_xl",
                        help="Output directory")
     parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
@@ -686,7 +715,8 @@ def main():
         use_correction=args.use_correction,
         knee_tolerance=args.knee_tolerance,
         offset_percent=args.offset_percent,
-        percent_change=args.percent_change
+        percent_change=args.percent_change,
+        max_correction_magnitude=args.max_correction_magnitude
     )
 
     # Prune model
