@@ -275,15 +275,20 @@ class WandaPrunerWithCorrection:
             W_corrected: Corrected weights
             correction_stats: Dictionary with statistics
         """
-        out_features, in_features = W_orig.shape
+        # Ensure all tensors have the same dtype as weights
+        weight_dtype = W_orig.dtype
+
+        # Ensure js_mean is same dtype as weights
+        if js_mean.dtype != weight_dtype:
+            js_mean = js_mean.to(weight_dtype)
 
         # Compute reconstruction errors for all channels
         # error[i] = (W_pruned[i,:] - W_orig[i,:]) · js_mean
         W_diff = W_pruned - W_orig
         errors = torch.matmul(W_diff, js_mean)  # [out_features]
 
-        # Sum of |js_mean| at selected positions
-        sum_abs_js_mean = js_mean[selected_positions].abs().sum()
+        # Sum of |js_mean| at selected positions (ensure same dtype)
+        sum_abs_js_mean = js_mean[selected_positions].abs().sum().to(weight_dtype)
 
         if sum_abs_js_mean < 1e-10:
             if debug:
@@ -298,7 +303,9 @@ class WandaPrunerWithCorrection:
         # Shape: [out_features] * scalar -> [out_features]
 
         for j in selected_positions:
-            delta_W_j = -errors * torch.sign(js_mean[j]) / sum_abs_js_mean
+            # Ensure all components are same dtype
+            sign_val = torch.sign(js_mean[j]).to(weight_dtype)
+            delta_W_j = -errors * sign_val / sum_abs_js_mean
             W_corrected[:, j] += delta_W_j
 
         # Compute correction statistics
@@ -328,7 +335,7 @@ class WandaPrunerWithCorrection:
             W_pruned: Pruned weights
             actual_sparsity: Achieved sparsity
         """
-        out_features, in_features = W.shape
+        in_features = W.shape[1]
 
         # Compute scores
         scores = W.abs() * salience.unsqueeze(0)
@@ -358,7 +365,7 @@ class WandaPrunerWithCorrection:
             return
 
         # Get activation statistics
-        l2_salience, js_mean, raw_mean = self.get_activation_stats(name)
+        l2_salience, js_mean, _ = self.get_activation_stats(name)
         if l2_salience is None:
             if debug:
                 print(f"  DEBUG: No activation stats for {name}, skipping")
@@ -424,7 +431,7 @@ class WandaPrunerWithCorrection:
 
     def get_hook(self, name):
         """Create hook for activation capture."""
-        def hook(_module, input, _output):
+        def hook(_module, input, output):
             if name not in self.activation_data:
                 self.activation_data[name] = []
             if isinstance(input, tuple):
