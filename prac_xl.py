@@ -196,46 +196,85 @@ class WandaPrunerWithCorrection:
         return l2_salience, js_mean, raw_mean
 
     @torch.no_grad()
-    def select_moderate_positions(self, js_mean, debug=False):
+    def select_moderate_positions(self, js_mean, prune_mask, debug=False):
         """
-        Select moderate positions based on |js_mean|.
+        Select moderate positions among SURVIVING (non-pruned) weights.
+
+        Key insight: Only correct weights that survived pruning, not all weights.
 
         Algorithm:
-        1. Sort |js_mean| in descending order
-        2. Apply Kneedle on first half
-        3. Start from knee + offset
-        4. Select percent_change * in_features positions
+        1. Filter to only surviving weights (where prune_mask == True)
+        2. Among survivors, sort by |js_mean| in descending order
+        3. Apply Kneedle on first half
+        4. Start from knee + offset
+        5. Select percent_change * num_surviving positions
+
+        Args:
+            js_mean: James-Stein mean [in_features]
+            prune_mask: Boolean mask [out_features, in_features] (True = kept, False = pruned)
+            debug: Print debug info
 
         Returns:
-            selected_indices: Tensor of selected positions
+            selected_indices: Tensor of selected positions (column indices)
             knee_info: Dict with selection statistics
         """
-        abs_js_mean = js_mean.abs()
-        in_features = len(abs_js_mean)
+        # Count surviving weights per input channel (across all output channels)
+        # A channel is "surviving" if at least one output channel kept it
+        survival_count = prune_mask.sum(dim=0)  # [in_features]
+        is_surviving = survival_count > 0
+
+        # Filter to surviving channels only
+        surviving_indices = torch.where(is_surviving)[0]
+
+        if len(surviving_indices) == 0:
+            print(f"    ⚠️ No surviving weights to correct!")
+            return torch.tensor([], dtype=torch.long), None
+
+        abs_js_mean_surviving = js_mean[surviving_indices].abs()
 
         # Sort descending
-        sorted_values, sorted_indices = torch.sort(abs_js_mean, descending=True)
+        sorted_values, sorted_order = torch.sort(abs_js_mean_surviving, descending=True)
+        sorted_indices = surviving_indices[sorted_order]
+
+        num_surviving = len(surviving_indices)
 
         # Apply Kneedle on first half
-        first_half = sorted_values[:in_features // 2]
+        first_half = sorted_values[:num_surviving // 2]
+        if len(first_half) < 3:
+            # Too few survivors, select a fraction directly
+            num_to_select = max(1, int(self.percent_change * num_surviving))
+            selected_indices = sorted_indices[:num_to_select]
+            knee_info = {
+                'knee_idx': 0,
+                'knee_value': sorted_values[0].item() if len(sorted_values) > 0 else 0,
+                'start_idx': 0,
+                'end_idx': num_to_select,
+                'num_selected': num_to_select,
+                'num_surviving': num_surviving,
+                'selection_pct': num_to_select / num_surviving * 100,
+            }
+            if debug:
+                print(f"    Moderate selection (few survivors): {num_to_select}/{num_surviving} ({knee_info['selection_pct']:.2f}%)")
+            return selected_indices, knee_info
+
         knee_idx = find_knee_point(first_half, tolerance_offset=self.knee_tolerance)
 
         # Start position
-        offset_indices = int(self.offset_percent * in_features)
+        offset_indices = int(self.offset_percent * num_surviving)
         start_idx = knee_idx + offset_indices
-        start_idx = max(0, min(start_idx, in_features - 1))
+        start_idx = max(0, min(start_idx, num_surviving - 1))
 
-        # Number to select
-        num_to_select = max(1, int(self.percent_change * in_features))
-        end_idx = min(start_idx + num_to_select, in_features)
+        # Number to select (as fraction of SURVIVING weights)
+        num_to_select = max(1, int(self.percent_change * num_surviving))
+        end_idx = min(start_idx + num_to_select, num_surviving)
 
         # Adjust if needed
-        if end_idx == in_features and start_idx > 0:
-            start_idx = max(0, in_features - num_to_select)
+        if end_idx == num_surviving and start_idx > 0:
+            start_idx = max(0, num_surviving - num_to_select)
 
         actual_num = end_idx - start_idx
 
-        # Get selected indices (in original order)
+        # Get selected indices (in original input channel space)
         selected_indices = sorted_indices[start_idx:end_idx]
 
         knee_info = {
@@ -244,10 +283,12 @@ class WandaPrunerWithCorrection:
             'start_idx': start_idx,
             'end_idx': end_idx,
             'num_selected': actual_num,
-            'selection_pct': actual_num / in_features * 100,
+            'num_surviving': num_surviving,
+            'selection_pct': actual_num / num_surviving * 100 if num_surviving > 0 else 0,
         }
 
         if debug:
+            print(f"    Surviving channels: {num_surviving}")
             print(f"    Moderate selection: {actual_num} positions ({knee_info['selection_pct']:.2f}%)")
             print(f"    Knee idx: {knee_idx}, value: {knee_info['knee_value']:.6f}")
 
@@ -255,21 +296,25 @@ class WandaPrunerWithCorrection:
 
     @torch.no_grad()
     def correct_weights_vectorized(self, W_orig, W_pruned, js_mean,
-                                   selected_positions, debug=False):
+                                   selected_positions, prune_mask, debug=False):
         """
         Vectorized weight correction across all output channels.
+
+        Key: Only corrects SURVIVING moderate weights (not pruned ones).
 
         For each output channel i:
             error[i] = (W_pruned[i,:] - W_orig[i,:]) · js_mean
 
-        For each moderate position j:
+        For each moderate position j (among survivors):
             delta_W[i,j] = -error[i] * sign(js_mean[j]) / sum(|js_mean[selected]|)
+            But only if W_pruned[i,j] != 0 (i.e., weight survived pruning)
 
         Args:
             W_orig: Original weights [out_features, in_features]
             W_pruned: Pruned weights [out_features, in_features]
             js_mean: James-Stein mean [in_features]
-            selected_positions: Indices of moderate positions
+            selected_positions: Indices of moderate positions (column indices)
+            prune_mask: Boolean mask [out_features, in_features] (True = kept)
             debug: Print debug info
 
         Returns:
@@ -308,6 +353,10 @@ class WandaPrunerWithCorrection:
         # For each moderate position j:
         # delta_W[:,j] = -errors * sign(js_mean[j]) / sum_abs_js_mean
         # Constrain: |delta_W[i,j]| <= max_correction_magnitude * |W_orig[i,j]|
+        # Only apply to SURVIVING weights (where prune_mask[:, j] == True)
+
+        prune_mask_f32 = prune_mask.float()
+
         for j in selected_positions:
             sign_val = torch.sign(js_mean_f32[j])
             delta_W_j = -errors * sign_val / sum_abs_js_mean
@@ -318,12 +367,18 @@ class WandaPrunerWithCorrection:
             # Clamp delta to constraint
             delta_W_j_clamped = torch.clamp(delta_W_j, -max_change, max_change)
 
-            # Track how many were clamped
-            was_clamped = (delta_W_j.abs() > max_change).sum().item()
-            num_clamped += was_clamped
-            total_corrections += len(delta_W_j)
+            # Only apply correction to SURVIVING weights
+            # If weight was pruned (prune_mask[:, j] == False), don't correct it
+            delta_W_j_masked = delta_W_j_clamped * prune_mask_f32[:, j]
 
-            W_corrected[:, j] += delta_W_j_clamped
+            # Track how many were clamped (only among survivors)
+            survivors_at_j = prune_mask[:, j]
+            if survivors_at_j.sum() > 0:
+                was_clamped = ((delta_W_j.abs() > max_change) & survivors_at_j).sum().item()
+                num_clamped += was_clamped
+                total_corrections += survivors_at_j.sum().item()
+
+            W_corrected[:, j] += delta_W_j_masked
 
         # Convert back to original dtype
         W_corrected = W_corrected.to(weight_dtype)
@@ -357,6 +412,7 @@ class WandaPrunerWithCorrection:
 
         Returns:
             W_pruned: Pruned weights
+            prune_mask: Boolean mask (True = kept, False = pruned)
             actual_sparsity: Achieved sparsity
         """
         in_features = W.shape[1]
@@ -377,7 +433,7 @@ class WandaPrunerWithCorrection:
         W_pruned = W * mask.float()
         actual_sparsity = (W_pruned == 0).float().mean().item()
 
-        return W_pruned, actual_sparsity
+        return W_pruned, mask, actual_sparsity
 
     @torch.no_grad()
     def prune_layer(self, name, module, debug=False):
@@ -409,21 +465,26 @@ class WandaPrunerWithCorrection:
         js_mean_device = js_mean.to(self.device).to(W.dtype)
 
         # Step 1: Wanda pruning
-        W_pruned, actual_sparsity = self.prune_weights_wanda(
+        W_pruned, prune_mask, actual_sparsity = self.prune_weights_wanda(
             W_device, l2_salience_device, self.sparsity
         )
 
         # Step 2: Moderate weight correction (if enabled)
         if self.use_correction:
-            # Select moderate positions
+            # Select moderate positions (among surviving weights)
             selected_positions, knee_info = self.select_moderate_positions(
-                js_mean_device, debug=debug
+                js_mean_device, prune_mask, debug=debug
             )
 
-            # Correct weights
-            W_final, correction_stats = self.correct_weights_vectorized(
-                W_device, W_pruned, js_mean_device, selected_positions, debug=debug
-            )
+            # Correct weights (only surviving ones)
+            if knee_info is not None and len(selected_positions) > 0:
+                W_final, correction_stats = self.correct_weights_vectorized(
+                    W_device, W_pruned, js_mean_device, selected_positions,
+                    prune_mask, debug=debug
+                )
+            else:
+                W_final = W_pruned
+                correction_stats = None
         else:
             W_final = W_pruned
             knee_info = None
