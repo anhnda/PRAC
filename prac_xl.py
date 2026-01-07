@@ -275,20 +275,22 @@ class WandaPrunerWithCorrection:
             W_corrected: Corrected weights
             correction_stats: Dictionary with statistics
         """
-        # Ensure all tensors have the same dtype as weights
+        # Store original dtype and convert everything to float32 for computation
+        # This avoids bfloat16 compatibility issues with certain operations
         weight_dtype = W_orig.dtype
 
-        # Ensure js_mean is same dtype as weights
-        if js_mean.dtype != weight_dtype:
-            js_mean = js_mean.to(weight_dtype)
+        # Convert to float32 for computation
+        W_orig_f32 = W_orig.float()
+        W_pruned_f32 = W_pruned.float()
+        js_mean_f32 = js_mean.float()
 
         # Compute reconstruction errors for all channels
         # error[i] = (W_pruned[i,:] - W_orig[i,:]) · js_mean
-        W_diff = W_pruned - W_orig
-        errors = torch.matmul(W_diff, js_mean)  # [out_features]
+        W_diff = W_pruned_f32 - W_orig_f32
+        errors = torch.matmul(W_diff, js_mean_f32)  # [out_features]
 
-        # Sum of |js_mean| at selected positions (ensure same dtype)
-        sum_abs_js_mean = js_mean[selected_positions].abs().sum().to(weight_dtype)
+        # Sum of |js_mean| at selected positions
+        sum_abs_js_mean = js_mean_f32[selected_positions].abs().sum()
 
         if sum_abs_js_mean < 1e-10:
             if debug:
@@ -296,20 +298,20 @@ class WandaPrunerWithCorrection:
             return W_pruned.clone(), None
 
         # Vectorized correction
-        W_corrected = W_pruned.clone()
+        W_corrected = W_pruned_f32.clone()
 
         # For each moderate position j:
         # delta_W[:,j] = -errors * sign(js_mean[j]) / sum_abs_js_mean
-        # Shape: [out_features] * scalar -> [out_features]
-
         for j in selected_positions:
-            # Ensure all components are same dtype
-            sign_val = torch.sign(js_mean[j]).to(weight_dtype)
+            sign_val = torch.sign(js_mean_f32[j])
             delta_W_j = -errors * sign_val / sum_abs_js_mean
             W_corrected[:, j] += delta_W_j
 
-        # Compute correction statistics
-        errors_after = torch.matmul(W_corrected - W_orig, js_mean)
+        # Convert back to original dtype
+        W_corrected = W_corrected.to(weight_dtype)
+
+        # Compute correction statistics (in float32 for accuracy)
+        errors_after = torch.matmul(W_corrected.float() - W_orig_f32, js_mean_f32)
         error_reduction = (errors.abs() - errors_after.abs()).mean().item()
 
         correction_stats = {
@@ -431,7 +433,7 @@ class WandaPrunerWithCorrection:
 
     def get_hook(self, name):
         """Create hook for activation capture."""
-        def hook(_module, input, output):
+        def hook(module, input, output):
             if name not in self.activation_data:
                 self.activation_data[name] = []
             if isinstance(input, tuple):
