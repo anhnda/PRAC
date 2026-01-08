@@ -168,9 +168,10 @@ class WandaPrunerWithFullHessian:
         print(f"  Damping: {damping} (for numerical stability)")
         if use_correction:
             print(f"  Full Hessian correction: ENABLED")
+            print(f"    - Selection strategy: TOP surviving weights")
             print(f"    - Correction percent: {percent_change*100:.1f}% of weights")
             print(f"    - Max magnitude: {max_correction_magnitude*100:.1f}% of original weight")
-            print(f"    - Solver: Cholesky decomposition")
+            print(f"    - Solver: Cholesky decomposition (Normal Equations)")
         else:
             print(f"  Correction: DISABLED")
         print(f"  Special: lm_head is NOT pruned")
@@ -207,14 +208,16 @@ class WandaPrunerWithFullHessian:
     @torch.no_grad()
     def select_moderate_positions(self, js_mean, prune_mask, debug=False):
         """
-        Select moderate positions among SURVIVING (non-pruned) weights.
+        Select TOP surviving weights for Full Hessian correction.
 
-        NOTE: With full Hessian correction, selecting TOP weights (highest salience)
-        instead of MODERATE weights may be more effective, as they have more capacity
-        to compensate for lost weights through the correlation structure.
+        RATIONALE: Full Hessian correction is a second-order optimization that leverages
+        the correlation structure between weights. TOP weights (highest salience) have:
+        1. Strongest correlation with pruned channels
+        2. Highest energy to compensate for lost signal
+        3. Most capacity to absorb corrections without destabilizing
 
-        Current implementation uses "moderate" selection (middle of importance curve).
-        To use TOP selection, modify the start_idx calculation to always start at 0.
+        This differs from the diagonal/moderate approach where we avoided top weights
+        to prevent over-correction. The Hessian naturally regularizes corrections.
         """
         # Count surviving weights per input channel
         survival_count = prune_mask.sum(dim=0)  # [in_features]
@@ -229,64 +232,43 @@ class WandaPrunerWithFullHessian:
 
         abs_js_mean_surviving = js_mean[surviving_indices].abs()
 
-        # Sort descending
+        # Sort descending by salience (L2 norm)
         sorted_values, sorted_order = torch.sort(abs_js_mean_surviving, descending=True)
         sorted_indices = surviving_indices[sorted_order]
 
         num_surviving = len(surviving_indices)
 
-        # Apply Kneedle on first half
-        first_half = sorted_values[:num_surviving // 2]
-        if len(first_half) < 3:
-            num_to_select = max(1, int(self.percent_change * num_surviving))
-            selected_indices = sorted_indices[:num_to_select]
-            knee_info = {
-                'knee_idx': 0,
-                'knee_value': sorted_values[0].item() if len(sorted_values) > 0 else 0,
-                'start_idx': 0,
-                'end_idx': num_to_select,
-                'num_selected': num_to_select,
-                'num_surviving': num_surviving,
-                'selection_pct': num_to_select / num_surviving * 100,
-            }
-            if debug:
-                print(f"    Moderate selection (few survivors): {num_to_select}/{num_surviving} ({knee_info['selection_pct']:.2f}%)")
-            return selected_indices, knee_info
-
-        knee_idx = find_knee_point(first_half, tolerance_offset=self.knee_tolerance)
-
-        # Start position
-        offset_indices = int(self.offset_percent * num_surviving)
-        start_idx = knee_idx + offset_indices
-        start_idx = max(0, min(start_idx, num_surviving - 1))
-
-        # Number to select
+        # Select TOP-N weights (highest salience)
+        # For full Hessian, we want the weights with most capacity
         num_to_select = max(1, int(self.percent_change * num_surviving))
-        end_idx = min(start_idx + num_to_select, num_surviving)
 
-        # Adjust if needed
-        if end_idx == num_surviving and start_idx > 0:
-            start_idx = max(0, num_surviving - num_to_select)
+        # Always start from index 0 (top weights)
+        start_idx = 0
+        end_idx = min(num_to_select, num_surviving)
 
-        actual_num = end_idx - start_idx
-
-        # Get selected indices
+        # Get TOP indices
         selected_indices = sorted_indices[start_idx:end_idx]
+
+        # For compatibility with stats tracking, compute a "pseudo knee"
+        # This is just the transition point where we stop selecting
+        knee_idx = end_idx
+        knee_value = sorted_values[min(knee_idx, len(sorted_values) - 1)].item() if len(sorted_values) > 0 else 0
 
         knee_info = {
             'knee_idx': knee_idx,
-            'knee_value': sorted_values[knee_idx].item(),
+            'knee_value': knee_value,
             'start_idx': start_idx,
             'end_idx': end_idx,
-            'num_selected': actual_num,
+            'num_selected': end_idx - start_idx,
             'num_surviving': num_surviving,
-            'selection_pct': actual_num / num_surviving * 100 if num_surviving > 0 else 0,
+            'selection_pct': (end_idx - start_idx) / num_surviving * 100 if num_surviving > 0 else 0,
+            'selection_strategy': 'TOP',
         }
 
         if debug:
             print(f"    Surviving channels: {num_surviving}")
-            print(f"    Moderate selection: {actual_num} positions ({knee_info['selection_pct']:.2f}%)")
-            print(f"    Knee idx: {knee_idx}, value: {knee_info['knee_value']:.6f}")
+            print(f"    TOP selection: {knee_info['num_selected']} positions ({knee_info['selection_pct']:.2f}%)")
+            print(f"    Salience range: [{sorted_values[0].item():.6f}, {sorted_values[end_idx-1].item():.6f}]")
 
         return selected_indices, knee_info
 
@@ -310,7 +292,7 @@ class WandaPrunerWithFullHessian:
             W_pruned: Pruned weights [out_features, in_features]
             js_mean: James-Stein mean [in_features]
             hessian: Full Hessian matrix [in_features, in_features]
-            selected_positions: Indices of moderate positions
+            selected_positions: Indices of selected positions (TOP surviving weights)
             prune_mask: Boolean mask [out_features, in_features] (True = kept)
             debug: Print debug info
 
@@ -499,7 +481,7 @@ class WandaPrunerWithFullHessian:
 
         # Step 2: Full Hessian correction (if enabled)
         if self.use_correction:
-            # Select moderate positions
+            # Select TOP surviving positions (highest salience)
             selected_positions, knee_info = self.select_moderate_positions(
                 js_mean_device, prune_mask, debug=debug
             )
