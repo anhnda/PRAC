@@ -334,6 +334,13 @@ class WandaDataExporter:
             'L2_norm[X]': export_dict['L2_norm[X]'],
             'JS_mean[X]': export_dict['JS_mean[X]'],
         }
+
+        # Add per-feature min/max/std if available
+        if 'min[X]' in export_dict:
+            df_data['min[X]'] = export_dict['min[X]']
+            df_data['max[X]'] = export_dict['max[X]']
+            df_data['std[X]'] = export_dict['std[X]']
+
         df = pd.DataFrame(df_data)
 
         csv_path = os.path.join(output_dir, f"{prefix}_stats.csv")
@@ -353,19 +360,26 @@ class WandaDataExporter:
 
         # --- 3. Save complete data as comprehensive NPZ ---
         npz_complete_path = os.path.join(output_dir, f"{prefix}_complete.npz")
-        np.savez(
-            npz_complete_path,
-            layer_name=export_dict['layer_name'],
-            channel_id=export_dict['channel_id'],
-            out_features=export_dict['out_features'],
-            in_features=export_dict['in_features'],
-            W=export_dict['W'],
-            E_X=export_dict['E[X]'],
-            L2_norm_X=export_dict['L2_norm[X]'],
-            JS_mean_X=export_dict['JS_mean[X]'],
-            grand_mean=export_dict['grand_mean'],
-            shrinkage_amount=export_dict['shrinkage_amount'],
-        )
+        save_dict = {
+            'layer_name': export_dict['layer_name'],
+            'channel_id': export_dict['channel_id'],
+            'out_features': export_dict['out_features'],
+            'in_features': export_dict['in_features'],
+            'W': export_dict['W'],
+            'E_X': export_dict['E[X]'],
+            'L2_norm_X': export_dict['L2_norm[X]'],
+            'JS_mean_X': export_dict['JS_mean[X]'],
+            'grand_mean': export_dict['grand_mean'],
+            'shrinkage_amount': export_dict['shrinkage_amount'],
+        }
+
+        # Add per-feature min/max/std if available
+        if 'min[X]' in export_dict:
+            save_dict['min[X]'] = export_dict['min[X]']
+            save_dict['max[X]'] = export_dict['max[X]']
+            save_dict['std[X]'] = export_dict['std[X]']
+
+        np.savez(npz_complete_path, **save_dict)
         print(f"✅ Saved complete data NPZ: {npz_complete_path}")
 
         # --- 4. Save metadata ---
@@ -386,14 +400,29 @@ class WandaDataExporter:
             f.write(f"  E[X]: Mean activation E[X[:,j]]\n")
             f.write(f"  L2_norm[X]: L2 norm ||X_j||_2 (for Wanda scoring)\n")
             f.write(f"  JS_mean[X]: James-Stein estimated mean\n")
+            if 'min[X]' in export_dict:
+                f.write(f"  min[X]: Min activation value per feature\n")
+                f.write(f"  max[X]: Max activation value per feature\n")
+                f.write(f"  std[X]: Standard deviation per feature\n")
             f.write(f"\nArrays in NPZ files:\n")
             f.write(f"  W: Weight matrix [out_features, in_features]\n")
             f.write(f"  E_X: Mean activation [in_features]\n")
             f.write(f"  L2_norm_X: L2 norm [in_features]\n")
             f.write(f"  JS_mean_X: James-Stein mean [in_features]\n")
+            if 'min[X]' in export_dict:
+                f.write(f"  min[X]: Min per feature [in_features]\n")
+                f.write(f"  max[X]: Max per feature [in_features]\n")
+                f.write(f"  std[X]: Std per feature [in_features]\n")
             f.write(f"\nWanda Scoring:\n")
             f.write(f"  Score_ij = |W_ij| * L2_norm_X[j]\n")
             f.write(f"  where W_ij is element [i,j] of weight matrix W\n")
+            f.write(f"\nPer-Feature Statistics:\n")
+            f.write(f"  Each feature j has a vector of activation values across all tokens\n")
+            f.write(f"  E[X_j]: Mean of this vector\n")
+            if 'min[X]' in export_dict:
+                f.write(f"  min[X_j]: Minimum value in this vector\n")
+                f.write(f"  max[X_j]: Maximum value in this vector\n")
+                f.write(f"  std[X_j]: Standard deviation of this vector\n")
 
         print(f"✅ Saved metadata: {metadata_path}")
 
