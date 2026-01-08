@@ -343,10 +343,15 @@ class WandaPrunerWithFullHessian:
         solve_failures = 0
 
         # Build RHS matrix: [out_features, num_selected]
-        # Each row i has: -error[i] for all selected positions
+        # For each output channel i, we want to solve:
+        #   H_sub @ delta_W[i, selected] = -error[i] * js_mean[selected]
+        # The gradient of error[i] w.r.t. W[i,j] is js_mean[j]
         out_features = W_orig.shape[0]
         num_selected = len(selected_positions)
-        RHS = torch.ones(out_features, num_selected, device=self.device) * (-errors.unsqueeze(1))
+
+        # RHS[i, :] = -error[i] * js_mean[selected]
+        js_mean_selected = js_mean_f32[selected_positions]  # [num_selected]
+        RHS = -errors.unsqueeze(1) * js_mean_selected.unsqueeze(0)  # [out_features, num_selected]
 
         try:
             # Solve: H_sub @ X = RHS^T
