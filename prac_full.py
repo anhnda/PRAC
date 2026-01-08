@@ -384,8 +384,8 @@ class WandaPrunerWithFullHessian:
             num_clamped += was_clamped
             total_corrections += survivors_at_selected.sum().item()
 
-            # Apply correction
-            W_corrected[i, selected_positions] += delta_W_masked.cpu()
+            # Apply correction (keep on same device)
+            W_corrected[i, selected_positions] += delta_W_masked
 
         # Convert back to original dtype
         W_corrected = W_corrected.to(weight_dtype)
