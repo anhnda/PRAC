@@ -209,7 +209,12 @@ class WandaPrunerWithFullHessian:
         """
         Select moderate positions among SURVIVING (non-pruned) weights.
 
-        Same logic as diagonal version - only the correction step differs.
+        NOTE: With full Hessian correction, selecting TOP weights (highest salience)
+        instead of MODERATE weights may be more effective, as they have more capacity
+        to compensate for lost weights through the correlation structure.
+
+        Current implementation uses "moderate" selection (middle of importance curve).
+        To use TOP selection, modify the start_idx calculation to always start at 0.
         """
         # Count surviving weights per input channel
         survival_count = prune_mask.sum(dim=0)  # [in_features]
@@ -322,10 +327,6 @@ class WandaPrunerWithFullHessian:
         # Hessian is already on GPU from calibration, just ensure float32
         hessian_f32 = hessian.float().to(self.device)
 
-        # Compute reconstruction errors for all channels
-        W_diff = W_pruned_f32 - W_orig_f32
-        errors = torch.matmul(W_diff, js_mean_f32)  # [out_features]
-
         if len(selected_positions) == 0:
             if debug:
                 print(f"    ⚠️ No positions selected, no correction")
@@ -342,32 +343,35 @@ class WandaPrunerWithFullHessian:
         W_corrected = W_pruned_f32.clone()
         solve_failures = 0
 
-        # Build RHS matrix: [out_features, num_selected]
-        # For each output channel i, we want to solve:
-        #   H_sub @ delta_W[i, selected] = -error[i] * js_mean[selected]
-        # The gradient of error[i] w.r.t. W[i,j] is js_mean[j]
-        out_features = W_orig.shape[0]
-        num_selected = len(selected_positions)
+        # Build RHS using FULL Hessian correlation structure
+        # Objective: Minimize ||X W_orig^T - X (W_pruned + ΔW)^T||²
+        # Normal equations: H_sub @ ΔW^T = H[selected, all] @ (W_orig - W_pruned)^T
+        # This captures how the LOST weights project onto selected positions through correlations
 
-        # RHS[i, :] = -error[i] * js_mean[selected]
-        js_mean_selected = js_mean_f32[selected_positions]  # [num_selected]
-        RHS = -errors.unsqueeze(1) * js_mean_selected.unsqueeze(0)  # [out_features, num_selected]
+        W_diff = W_orig_f32 - W_pruned_f32  # [out_features, in_features]
+
+        # RHS = H[selected, :] @ W_diff^T
+        # Shape: [num_selected, in_features] @ [in_features, out_features] = [num_selected, out_features]
+        H_selected_all = hessian_f32[selected_positions_dev, :]  # [num_selected, in_features]
+        RHS = torch.matmul(H_selected_all, W_diff.t())  # [num_selected, out_features]
 
         try:
-            # Solve: H_sub @ X = RHS^T
-            # where X is [num_selected, out_features] and we want Delta = X^T
+            # Solve: H_sub @ delta_W^T = RHS
+            # where RHS is [num_selected, out_features]
             # Using Cholesky decomposition for stability
             L = torch.linalg.cholesky(H_sub)
             # cholesky_solve(B, L) solves A @ X = B where A = L @ L^T
-            # RHS.t() is [num_selected, out_features], so we solve for each column
-            delta_W_all = torch.cholesky_solve(RHS.t(), L).t()
-            # delta_W_all is now [out_features, num_selected]
+            # RHS is [num_selected, out_features], result is [num_selected, out_features]
+            delta_W_T = torch.cholesky_solve(RHS, L)
+            # Transpose to get [out_features, num_selected]
+            delta_W_all = delta_W_T.t()
 
         except RuntimeError as e:
             # If Cholesky fails, fall back to lstsq (more robust but slower)
             if debug:
                 print(f"    ⚠️ Cholesky failed, using lstsq: {e}")
-            delta_W_all = torch.linalg.lstsq(H_sub, RHS.t()).solution.t()
+            delta_W_T = torch.linalg.lstsq(H_sub, RHS).solution
+            delta_W_all = delta_W_T.t()
             solve_failures = 1
 
         # Apply magnitude constraint: |ΔW[i,j]| ≤ max_correction_magnitude * |W_orig[i,j]|
@@ -391,13 +395,21 @@ class WandaPrunerWithFullHessian:
         # Convert back to original dtype
         W_corrected = W_corrected.to(weight_dtype)
 
-        # Compute correction statistics
-        errors_after = torch.matmul(W_corrected.float() - W_orig_f32, js_mean_f32)
-        error_reduction = (errors.abs() - errors_after.abs()).mean().item()
+        # Compute correction statistics using reconstruction error
+        # Reconstruction error in activation space: ||X(W_orig - W)^T||_F²
+        # We approximate this using the Hessian: (W_orig - W) H (W_orig - W)^T
+        W_diff_pruned = W_orig_f32 - W_pruned_f32
+        W_diff_corrected = W_orig_f32 - W_corrected.float()
+
+        # For efficiency, compute per-channel error using js_mean as a proxy
+        # (full Hessian computation would be too expensive here)
+        errors_before = torch.matmul(W_diff_pruned, js_mean_f32).abs().mean().item()
+        errors_after = torch.matmul(W_diff_corrected, js_mean_f32).abs().mean().item()
+        error_reduction = errors_before - errors_after
 
         correction_stats = {
-            'error_before_mean': errors.abs().mean().item(),
-            'error_after_mean': errors_after.abs().mean().item(),
+            'error_before_mean': errors_before,
+            'error_after_mean': errors_after,
             'error_reduction_mean': error_reduction,
             'num_corrected_positions': len(selected_positions),
             'num_clamped': num_clamped,
