@@ -377,16 +377,24 @@ class WandaPrunerWithFullHessian:
         # Convert back to original dtype
         W_corrected = W_corrected.to(weight_dtype)
 
-        # Compute correction statistics using reconstruction error
+        # Compute correction statistics using TRUE reconstruction error
         # Reconstruction error in activation space: ||X(W_orig - W)^T||_F²
-        # We approximate this using the Hessian: (W_orig - W) H (W_orig - W)^T
+        # Using FULL Hessian: trace((W_orig - W) H (W_orig - W)^T)
         W_diff_pruned = W_orig_f32 - W_pruned_f32
         W_diff_corrected = W_orig_f32 - W_corrected.float()
 
-        # For efficiency, compute per-channel error using js_mean as a proxy
-        # (full Hessian computation would be too expensive here)
-        errors_before = torch.matmul(W_diff_pruned, js_mean_f32).abs().mean().item()
-        errors_after = torch.matmul(W_diff_corrected, js_mean_f32).abs().mean().item()
+        # Compute quadratic form: trace(W_diff @ H_full @ W_diff^T)
+        # Use FULL Hessian, not just H_sub, to measure true reconstruction error
+        hessian_f32_full = hessian_f32  # [in_features, in_features]
+
+        # For memory efficiency, compute per-channel and average
+        # error[i] = W_diff[i, :] @ H_full @ W_diff[i, :]^T
+        # Vectorized: (W_diff @ H_full) element-wise-multiply W_diff, then sum over features
+        errors_before_vec = (W_diff_pruned @ hessian_f32_full) * W_diff_pruned
+        errors_after_vec = (W_diff_corrected @ hessian_f32_full) * W_diff_corrected
+
+        errors_before = errors_before_vec.sum(dim=1).mean().item()
+        errors_after = errors_after_vec.sum(dim=1).mean().item()
         error_reduction = errors_before - errors_after
 
         correction_stats = {
@@ -401,9 +409,10 @@ class WandaPrunerWithFullHessian:
         }
 
         if debug:
-            print(f"    Error before: {correction_stats['error_before_mean']:.6f}")
-            print(f"    Error after: {correction_stats['error_after_mean']:.6f}")
-            print(f"    Reduction: {error_reduction:.6f}")
+            print(f"    Error before (full H): {correction_stats['error_before_mean']:.6f}")
+            print(f"    Error after (full H): {correction_stats['error_after_mean']:.6f}")
+            print(f"    Reduction: {error_reduction:.6f} ({error_reduction/errors_before*100:.2f}%)")
+            print(f"    Correction magnitude: mean={delta_W_all.abs().mean().item():.6f}, max={delta_W_all.abs().max().item():.6f}")
             print(f"    Clamped: {num_clamped}/{total_corrections} ({correction_stats['clamp_percentage']:.1f}%)")
             if solve_failures > 0:
                 print(f"    Solve failures: {solve_failures} (used lstsq fallback)")
