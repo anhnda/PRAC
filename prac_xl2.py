@@ -1,17 +1,19 @@
 """
-Wanda Pruning with Moderate Weight Correction - XL Version (Normalized Moment Ratio)
+Wanda Pruning with Moderate Weight Correction - XL Version (Moment Ratio + Renormalization)
 
 Combines Wanda pruning with moderate weight correction using normalized moment ratio:
 1. Apply Wanda pruning (Score_ij = |W_ij| * ||X_j||_2)
 2. Select "moderate" positions based on |JS_mean(X_j)|
-3. Correct weights using normalized moment ratio:
-   ΔW_ij = -Error_i × [E[X_j]/(E[X_j²]+λ)] / Σ_k [E[X_k]/(E[X_k²]+λ)]
+3. Correct weights using normalized moment ratio with renormalization:
+   - Compute: ΔW_ij = -Error_i × [E[X_j]/(E[X_j²]+λ)] / Σ_k [...]
+   - Clamp to magnitude constraints
+   - Renormalize to ensure error reduction even after clamping
 4. Fully vectorized across all output channels
 
 Key Features:
 - L2 norm salience for Wanda scoring
 - Normalized moment ratio for adaptive weight correction
-- Proper normalization ensures error reduction
+- Renormalization after clamping preserves error reduction
 - James-Stein mean estimator for moderate position selection
 - Moderate position selection using Kneedle algorithm
 - Vectorized correction across all channels
@@ -155,15 +157,16 @@ class WandaPrunerWithCorrection:
         self.hooks = []
         self.layer_stats = {}
 
-        print(f"\n[Wanda Pruner with Moderate Correction - XL Version (Normalized Moment Ratio)]")
+        print(f"\n[Wanda Pruner with Moderate Correction - XL Version (Moment Ratio + Renorm)]")
         print(f"  Target sparsity: {sparsity*100:.1f}% (keep {(1-sparsity)*100:.1f}%)")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample")
         print(f"  Salience metric: ||X_j||_2 (L2 norm)")
         print(f"  Scoring: Score_ij = |W_ij| * ||X_j||_2")
         print(f"  Memory optimization: Incremental statistics (no activation storage)")
         if use_correction:
-            print(f"  Moderate correction: ENABLED (Normalized Moment Ratio)")
+            print(f"  Moderate correction: ENABLED (Moment Ratio + Renormalization)")
             print(f"    - Formula: ΔW_ij = -Error_i × [E[X_j]/(E[X_j²]+λ)] / Σ_k [...]")
+            print(f"    - Renormalization: Applied after clamping to ensure error reduction")
             print(f"    - Lambda regularization: {lambda_reg}")
             print(f"    - Correction percent: {percent_change*100:.1f}% of weights")
             print(f"    - Max magnitude: {max_correction_magnitude*100:.1f}% of original weight")
@@ -305,19 +308,20 @@ class WandaPrunerWithCorrection:
     def correct_weights_vectorized(self, W_orig, W_pruned, raw_mean, second_moment,
                                    selected_positions, prune_mask, debug=False):
         """
-        Vectorized weight correction using normalized moment ratio.
+        Vectorized weight correction using normalized moment ratio with renormalization.
 
         Key: Only corrects SURVIVING moderate weights (not pruned ones).
         Uses adaptive weighting based on first and second moments with proper normalization.
 
-        For each output channel i:
-            error[i] = (W_pruned[i,:] - W_orig[i,:]) · E[X]
+        Algorithm:
+        1. Compute ideal corrections: ΔW[i,j] = -error[i] × w_j / Σ_k w_k
+           where w_j = E[X_j] / (E[X_j²] + λ)
+        2. Clamp corrections to magnitude constraints
+        3. Renormalize clamped corrections to ensure error reduction
+           renorm_factor[i] = -error[i] / Σ_j (clamped_ΔW[i,j] × E[X_j])
+        4. Apply final corrections: ΔW_final[i,j] = clamped_ΔW[i,j] × renorm_factor[i]
 
-        For each moderate position j (among survivors):
-            ΔW[i,j] = -error[i] × [E[X_j] / (E[X_j²] + λ)] / Σ_k [E[X_k] / (E[X_k²] + λ)]
-            But only if W_pruned[i,j] != 0 (i.e., weight survived pruning)
-
-        The normalization ensures: Σ_j ΔW[i,j] × E[X_j] ≈ -error[i]
+        This ensures: Σ_j ΔW_final[i,j] × E[X_j] ≈ -error[i] even after clamping
 
         Args:
             W_orig: Original weights [out_features, in_features]
@@ -357,7 +361,7 @@ class WandaPrunerWithCorrection:
                 print(f"    ⚠️ Sum of adaptive weights too small, no correction")
             return W_pruned.clone(), None
 
-        # Vectorized correction
+        # Vectorized correction with renormalization after clamping
         W_corrected = W_pruned_f32.clone()
 
         # Track clamping statistics
@@ -365,18 +369,23 @@ class WandaPrunerWithCorrection:
         total_corrections = 0
 
         # For each moderate position j:
-        # ΔW[:,j] = -errors × (adaptive_weight[j] / sum_adaptive_weights)
-        # This ensures proper normalization: Σ_j ΔW[:,j] × E[X_j] = -errors
-        # Constrain: |ΔW[i,j]| <= max_correction_magnitude × |W_orig[i,j]|
+        # Step 1: Compute ideal corrections
+        # Step 2: Clamp to magnitude constraints
+        # Step 3: Renormalize so clamped corrections still reduce error
         # Only apply to SURVIVING weights (where prune_mask[:, j] == True)
 
         prune_mask_f32 = prune_mask.float()
+        out_features = W_orig_f32.shape[0]
 
+        # Store all corrections before applying (for renormalization)
+        all_deltas = {}
+
+        # Step 1 & 2: Compute and clamp corrections
         for idx, j in enumerate(selected_positions):
             # Normalized moment ratio correction
             adaptive_weight = adaptive_weights[idx] / sum_adaptive_weights
 
-            # Compute correction
+            # Compute ideal correction
             delta_W_j = -errors * adaptive_weight
 
             # Compute magnitude constraint: max 5% of original weight magnitude
@@ -389,6 +398,9 @@ class WandaPrunerWithCorrection:
             # If weight was pruned (prune_mask[:, j] == False), don't correct it
             delta_W_j_masked = delta_W_j_clamped * prune_mask_f32[:, j]
 
+            # Store for later
+            all_deltas[j.item()] = delta_W_j_masked
+
             # Track how many were clamped (only among survivors)
             survivors_at_j = prune_mask[:, j]
             if survivors_at_j.sum() > 0:
@@ -396,7 +408,30 @@ class WandaPrunerWithCorrection:
                 num_clamped += was_clamped
                 total_corrections += survivors_at_j.sum().item()
 
-            W_corrected[:, j] += delta_W_j_masked
+        # Step 3: Renormalize corrections to ensure error reduction
+        # Compute actual error change from clamped corrections
+        actual_correction = torch.zeros(out_features, dtype=torch.float32, device=errors.device)
+        for j in selected_positions:
+            j_item = j.item()
+            actual_correction += all_deltas[j_item] * raw_mean_f32[j]
+
+        # Desired correction is -errors
+        desired_correction = -errors
+
+        # Compute renormalization factor per output channel
+        # To avoid division by zero, only renormalize where actual_correction is significant
+        renorm_factor = torch.ones_like(errors)
+        significant_mask = actual_correction.abs() > 1e-10
+        renorm_factor[significant_mask] = desired_correction[significant_mask] / actual_correction[significant_mask]
+
+        # Clamp renormalization factor to reasonable range (avoid extreme scaling)
+        renorm_factor = torch.clamp(renorm_factor, 0.1, 10.0)
+
+        # Step 4: Apply renormalized corrections
+        for j in selected_positions:
+            j_item = j.item()
+            delta_W_j_final = all_deltas[j_item] * renorm_factor
+            W_corrected[:, j] += delta_W_j_final
 
         # Convert back to original dtype
         W_corrected = W_corrected.to(weight_dtype)
@@ -413,6 +448,9 @@ class WandaPrunerWithCorrection:
             'num_clamped': num_clamped,
             'total_corrections': total_corrections,
             'clamp_percentage': num_clamped / total_corrections * 100 if total_corrections > 0 else 0,
+            'renorm_factor_mean': renorm_factor.mean().item(),
+            'renorm_factor_min': renorm_factor.min().item(),
+            'renorm_factor_max': renorm_factor.max().item(),
         }
 
         if debug:
@@ -420,6 +458,7 @@ class WandaPrunerWithCorrection:
             print(f"    Error after: {correction_stats['error_after_mean']:.6f}")
             print(f"    Reduction: {error_reduction:.6f}")
             print(f"    Clamped: {num_clamped}/{total_corrections} ({correction_stats['clamp_percentage']:.1f}%)")
+            print(f"    Renorm factor: mean={renorm_factor.mean():.4f}, range=[{renorm_factor.min():.4f}, {renorm_factor.max():.4f}]")
 
         return W_corrected, correction_stats
 
@@ -635,9 +674,9 @@ class WandaPrunerWithCorrection:
                 }
 
     def prune_model_sequential(self, calibration_data, n_samples=500, layer_batch_size=16):
-        """Batched sequential pruning with correction using normalized moment ratio."""
+        """Batched sequential pruning with correction using moment ratio and renormalization."""
         print("\n" + "=" * 80)
-        print("BATCHED SEQUENTIAL PRUNING WITH NORMALIZED MOMENT RATIO (XL Version)")
+        print("BATCHED SEQUENTIAL PRUNING WITH MOMENT RATIO + RENORM (XL Version)")
         print("=" * 80)
 
         if HAS_PSUTIL:
@@ -722,11 +761,20 @@ class WandaPrunerWithCorrection:
                     clamp_pcts = [self.layer_stats[k]['correction_stats']['clamp_percentage']
                                  for k in corrected_layers]
 
-                    print(f"\nNormalized moment ratio correction statistics ({len(corrected_layers)} layers):")
+                    renorm_means = [self.layer_stats[k]['correction_stats']['renorm_factor_mean']
+                                   for k in corrected_layers]
+                    renorm_mins = [self.layer_stats[k]['correction_stats']['renorm_factor_min']
+                                  for k in corrected_layers]
+                    renorm_maxs = [self.layer_stats[k]['correction_stats']['renorm_factor_max']
+                                  for k in corrected_layers]
+
+                    print(f"\nMoment ratio + renormalization correction statistics ({len(corrected_layers)} layers):")
                     print(f"  Mean error before: {np.mean(errors_before):.6f}")
                     print(f"  Mean error after: {np.mean(errors_after):.6f}")
                     print(f"  Mean reduction: {np.mean(reductions):.6f}")
                     print(f"  Mean clamp %: {np.mean(clamp_pcts):.1f}% (range: {np.min(clamp_pcts):.1f}% - {np.max(clamp_pcts):.1f}%)")
+                    print(f"  Renorm factor mean: {np.mean(renorm_means):.4f}")
+                    print(f"  Renorm factor range: [{np.mean(renorm_mins):.4f}, {np.mean(renorm_maxs):.4f}]")
 
         # Final cleanup
         self.activation_stats = {}
@@ -744,7 +792,7 @@ def load_wikitext2_simple(n_samples=128):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Wanda Pruning with Normalized Moment Ratio Weight Correction (XL Version)",
+        description="Wanda Pruning with Moment Ratio + Renormalization Weight Correction (XL Version)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
@@ -765,7 +813,7 @@ def main():
     parser.add_argument("--max-correction-magnitude", type=float, default=0.05,
                        help="Max correction magnitude as fraction of original weight (default 5%%)")
     parser.add_argument("--lambda-reg", type=float, default=1e-6,
-                       help="Lambda regularization for normalized moment ratio (default 1e-6)")
+                       help="Lambda regularization for moment ratio correction (default 1e-6)")
     parser.add_argument("--output-dir", type=str, default="./pruned_models/model_prac_xl2",
                        help="Output directory")
     parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
@@ -789,7 +837,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Wanda Pruning with Normalized Moment Ratio Weight Correction (XL Version)")
+    print("Wanda Pruning with Moment Ratio + Renormalization (XL Version)")
     print(f"Target Model: {model_name}")
     print("=" * 80)
     print(f"Device: {device}")
@@ -797,7 +845,7 @@ def main():
     print(f"Layer Batch Size: {args.layer_batch_size}")
     print(f"Moderate correction: {args.use_correction}")
     if args.use_correction:
-        print(f"  Correction method: Normalized moment ratio [E[X]/(E[X²]+λ)] / Σ[...]")
+        print(f"  Correction method: Moment ratio [E[X]/(E[X²]+λ)] with renormalization")
         print(f"  Lambda regularization: {args.lambda_reg}")
         print(f"  Correction percent: {args.percent_change*100:.1f}%")
         print(f"  Knee tolerance: {args.knee_tolerance}")

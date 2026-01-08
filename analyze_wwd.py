@@ -3,9 +3,16 @@ Analyze Wanda Pruning on Weight-Activation Data
 
 This script analyzes the effect of Wanda pruning on a single output channel:
 1. Loads exported data from export_wd.py
-2. Computes Wanda scores: Score_ij = |W_ij| * ||X_j||_2
-3. Prunes weights for output channel 0 by zeroing 50% with lowest scores
-4. Compares reconstruction loss: W[0,:] · E[X] vs W_pruned[0,:] · E[X]
+2. Visualizes activation statistics: sorted E[X_j] and variance Var[X_j]
+3. Computes Wanda scores: Score_ij = |W_ij| * ||X_j||_2
+4. Prunes weights for output channel 0 by zeroing 50% with lowest scores
+5. Compares reconstruction loss: W[0,:] · E[X] vs W_pruned[0,:] · E[X]
+
+Visualizations:
+- Sorted first moment E[X_j] across input features
+- Sorted variance Var[X_j] = E[X_j²] - E[X_j]²
+- Distribution histograms for E[X] and Var[X]
+- Pruning analysis: weights, scores, contributions
 
 Usage:
     python analyze_wwd.py --input-dir ./exported_wanda_data --sparsity 0.5
@@ -137,6 +144,90 @@ def analyze_reconstruction(W_original, W_pruned, E_X, out_channel_id=0):
     }
 
     return results
+
+
+def visualize_activation_statistics(E_X, L2_norm_X, output_dir):
+    """
+    Visualize activation statistics: sorted E[X_j] and variance.
+    """
+    in_features = len(E_X)
+
+    # Compute variance: Var[X] = E[X²] - E[X]²
+    E_X2 = L2_norm_X ** 2  # E[X²] from L2 norm
+    variance = E_X2 - E_X ** 2
+    variance = np.maximum(variance, 0)  # Ensure non-negative due to numerical errors
+    std_dev = np.sqrt(variance)
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Activation Statistics Analysis', fontsize=16, fontweight='bold')
+
+    # 1. Sorted E[X_j]
+    ax = axes[0, 0]
+    sorted_E_X = np.sort(E_X)
+    ax.plot(sorted_E_X, linewidth=2, color='blue')
+    ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+    ax.axhline(np.mean(E_X), color='red', linestyle='--', linewidth=2,
+               label=f'Mean: {np.mean(E_X):.4f}')
+    ax.axhline(np.median(E_X), color='green', linestyle='--', linewidth=2,
+               label=f'Median: {np.median(E_X):.4f}')
+    ax.set_xlabel('Input Channel (sorted by E[X])')
+    ax.set_ylabel('E[X_j]')
+    ax.set_title(f'Sorted First Moment E[X_j] (n={in_features})')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 2. Sorted Variance
+    ax = axes[0, 1]
+    sorted_var = np.sort(variance)
+    ax.plot(sorted_var, linewidth=2, color='purple')
+    ax.axhline(np.mean(variance), color='red', linestyle='--', linewidth=2,
+               label=f'Mean: {np.mean(variance):.6f}')
+    ax.axhline(np.median(variance), color='green', linestyle='--', linewidth=2,
+               label=f'Median: {np.median(variance):.6f}')
+    ax.set_xlabel('Input Channel (sorted by Var[X])')
+    ax.set_ylabel('Var[X_j] = E[X_j²] - E[X_j]²')
+    ax.set_title('Sorted Variance')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_yscale('log')
+
+    # 3. E[X] distribution histogram
+    ax = axes[1, 0]
+    ax.hist(E_X, bins=50, alpha=0.7, color='blue', edgecolor='black')
+    ax.axvline(np.mean(E_X), color='red', linestyle='--', linewidth=2,
+               label=f'Mean: {np.mean(E_X):.4f}')
+    ax.axvline(np.median(E_X), color='green', linestyle='--', linewidth=2,
+               label=f'Median: {np.median(E_X):.4f}')
+    ax.set_xlabel('E[X_j]')
+    ax.set_ylabel('Frequency')
+    ax.set_title('First Moment Distribution')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 4. Variance distribution histogram
+    ax = axes[1, 1]
+    ax.hist(variance, bins=50, alpha=0.7, color='purple', edgecolor='black')
+    ax.axvline(np.mean(variance), color='red', linestyle='--', linewidth=2,
+               label=f'Mean: {np.mean(variance):.6f}')
+    ax.axvline(np.median(variance), color='green', linestyle='--', linewidth=2,
+               label=f'Median: {np.median(variance):.6f}')
+    ax.set_xlabel('Var[X_j]')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Variance Distribution')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xscale('log')
+
+    plt.tight_layout()
+
+    # Save figure
+    plot_path = os.path.join(output_dir, 'activation_statistics.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"✅ Saved activation statistics: {plot_path}")
+
+    plt.close()
+
+    return variance, std_dev
 
 
 def visualize_pruning(W_original, W_pruned, scores, mask, E_X, L2_norm_X,
@@ -343,6 +434,11 @@ def main():
     # Save results
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Compute variance for results file
+    E_X2_for_results = L2_norm_X ** 2
+    variance_for_results = E_X2_for_results - E_X ** 2
+    variance_for_results = np.maximum(variance_for_results, 0)
+
     # Save numerical results
     results_path = os.path.join(args.output_dir, f"results_ch{out_channel_id}.txt")
     with open(results_path, 'w') as f:
@@ -351,6 +447,13 @@ def main():
         f.write(f"Layer: {data['layer_name']}\n")
         f.write(f"Output channel: {out_channel_id}\n")
         f.write(f"Sparsity: {args.sparsity * 100:.1f}%\n")
+        f.write(f"\nActivation Statistics:\n")
+        f.write(f"  E[X] range: [{E_X.min():.6f}, {E_X.max():.6f}]\n")
+        f.write(f"  E[X] mean: {E_X.mean():.6f}\n")
+        f.write(f"  E[X] std: {E_X.std():.6f}\n")
+        f.write(f"  Var[X] range: [{variance_for_results.min():.6f}, {variance_for_results.max():.6f}]\n")
+        f.write(f"  Var[X] mean: {variance_for_results.mean():.6f}\n")
+        f.write(f"  Var[X] median: {np.median(variance_for_results):.6f}\n")
         f.write(f"\nPruning Statistics:\n")
         f.write(f"  Channels kept: {num_kept}/{len(mask)}\n")
         f.write(f"  Channels pruned: {num_pruned}/{len(mask)}\n")
@@ -375,6 +478,11 @@ def main():
 
     print(f"\n✅ Saved results: {results_path}")
 
+    # Compute variance before saving CSV
+    E_X2 = L2_norm_X ** 2
+    variance_temp = E_X2 - E_X ** 2
+    variance_temp = np.maximum(variance_temp, 0)
+
     # Save detailed CSV
     csv_path = os.path.join(args.output_dir, f"analysis_ch{out_channel_id}.csv")
     df = pd.DataFrame({
@@ -385,6 +493,9 @@ def main():
         'wanda_score': scores,
         'L2_norm': L2_norm_X,
         'E[X]': E_X,
+        'E[X^2]': E_X2,
+        'Var[X]': variance_temp,
+        'Std[X]': np.sqrt(variance_temp),
         'JS_mean[X]': JS_mean_X,
         'contribution_orig': W_row * E_X,
         'contribution_pruned': W_row_pruned * E_X,
@@ -394,6 +505,19 @@ def main():
 
     # Create visualizations
     print(f"\n📊 Creating visualizations...")
+
+    # Visualize activation statistics (E[X] and variance)
+    print(f"  Creating activation statistics plots...")
+    variance, std_dev = visualize_activation_statistics(E_X, L2_norm_X, args.output_dir)
+
+    print(f"\n📈 Activation statistics:")
+    print(f"   E[X] range: [{E_X.min():.6f}, {E_X.max():.6f}]")
+    print(f"   E[X] mean: {E_X.mean():.6f}, std: {E_X.std():.6f}")
+    print(f"   Var[X] range: [{variance.min():.6f}, {variance.max():.6f}]")
+    print(f"   Var[X] mean: {variance.mean():.6f}, median: {np.median(variance):.6f}")
+
+    # Visualize pruning analysis
+    print(f"  Creating pruning analysis plots...")
     visualize_pruning(W, W_pruned, scores, mask, E_X, L2_norm_X,
                       out_channel_id, args.output_dir)
 
