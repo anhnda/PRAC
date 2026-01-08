@@ -3,15 +3,22 @@ Analyze Wanda Pruning on Weight-Activation Data
 
 This script analyzes the effect of Wanda pruning on a single output channel:
 1. Loads exported data from export_wd.py
-2. Visualizes activation statistics: sorted E[X_j] and variance Var[X_j]
+2. Visualizes per-feature activation statistics: E[X_j], min[X_j], max[X_j], std[X_j]
 3. Computes Wanda scores: Score_ij = |W_ij| * ||X_j||_2
 4. Prunes weights for output channel 0 by zeroing 50% with lowest scores
 5. Compares reconstruction loss: W[0,:] · E[X] vs W_pruned[0,:] · E[X]
 
+Per-Feature Statistics:
+For each input feature j, the script analyzes the distribution of activation values:
+- E[X_j]: Mean of all activation values for feature j
+- min[X_j]: Minimum activation value observed for feature j
+- max[X_j]: Maximum activation value observed for feature j
+- std[X_j]: Standard deviation of activation values for feature j
+
 Visualizations:
-- Sorted first moment E[X_j] across input features
-- Sorted variance Var[X_j] = E[X_j²] - E[X_j]²
-- Distribution histograms for E[X] and Var[X]
+- Sorted per-feature statistics (min, mean, max) across all input features
+- Sorted std per feature
+- Distribution histograms for per-feature means and std
 - Pruning analysis: weights, scores, contributions
 
 Usage:
@@ -31,7 +38,7 @@ def load_exported_data(input_dir):
     Load data exported by export_wd.py.
 
     Returns:
-        dict with keys: W, E_X, L2_norm_X, JS_mean_X, metadata
+        dict with keys: W, E_X, L2_norm_X, JS_mean_X, min_X, max_X, std_X, metadata
     """
     # Find the complete NPZ file
     npz_files = glob.glob(os.path.join(input_dir, "*_complete.npz"))
@@ -55,6 +62,18 @@ def load_exported_data(input_dir):
         'grand_mean': float(data['grand_mean']),
         'shrinkage_amount': float(data['shrinkage_amount']),
     }
+
+    # Load new per-feature statistics if available
+    if 'min[X]' in data:
+        result['min_X'] = data['min[X]']  # [in_features]
+        result['max_X'] = data['max[X]']  # [in_features]
+        result['std_X'] = data['std[X]']  # [in_features]
+    else:
+        # For backward compatibility, compute from L2_norm if not available
+        print("  ⚠️ Per-feature min/max/std not found (old export format)")
+        result['min_X'] = None
+        result['max_X'] = None
+        result['std_X'] = None
 
     return result
 
@@ -146,56 +165,55 @@ def analyze_reconstruction(W_original, W_pruned, E_X, out_channel_id=0):
     return results
 
 
-def visualize_activation_statistics(E_X, L2_norm_X, output_dir):
+def visualize_activation_statistics(E_X, min_X, max_X, std_X, output_dir):
     """
-    Visualize activation statistics: sorted E[X_j] and variance.
+    Visualize per-feature activation statistics: sorted E[X_j], min[X_j], max[X_j], std[X_j].
+
+    Args:
+        E_X: Mean per feature [in_features]
+        min_X: Min value per feature [in_features]
+        max_X: Max value per feature [in_features]
+        std_X: Std per feature [in_features]
+        output_dir: Output directory for plots
     """
     in_features = len(E_X)
 
-    # Compute variance: Var[X] = E[X²] - E[X]²
-    E_X2 = L2_norm_X ** 2  # E[X²] from L2 norm
-    variance = E_X2 - E_X ** 2
-    variance = np.maximum(variance, 0)  # Ensure non-negative due to numerical errors
-    std_dev = np.sqrt(variance)
-
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('Activation Statistics Analysis', fontsize=16, fontweight='bold')
+    fig.suptitle('Per-Feature Activation Statistics', fontsize=16, fontweight='bold')
 
-    # 1. Sorted E[X_j]
+    # 1. Sorted per-feature statistics (min, mean, max)
     ax = axes[0, 0]
-    sorted_E_X = np.sort(E_X)
-    ax.plot(sorted_E_X, linewidth=2, color='blue')
-    ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
-    ax.axhline(np.mean(E_X), color='red', linestyle='--', linewidth=2,
-               label=f'Mean: {np.mean(E_X):.4f}')
-    ax.axhline(np.median(E_X), color='green', linestyle='--', linewidth=2,
-               label=f'Median: {np.median(E_X):.4f}')
-    ax.set_xlabel('Input Channel (sorted by E[X])')
-    ax.set_ylabel('E[X_j]')
-    title_text = (f'Sorted First Moment E[X_j] (n={in_features})\n'
-                  f'min={E_X.min():.4f}, max={E_X.max():.4f}, std={E_X.std():.4f}')
+    sorted_indices = np.argsort(E_X)
+    x = np.arange(in_features)
+    ax.plot(x, E_X[sorted_indices], linewidth=2, color='blue', label='E[X_j] (mean)')
+    ax.plot(x, min_X[sorted_indices], linewidth=1.5, color='green', alpha=0.7, label='min[X_j]')
+    ax.plot(x, max_X[sorted_indices], linewidth=1.5, color='red', alpha=0.7, label='max[X_j]')
+    ax.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.3)
+    ax.set_xlabel('Input Feature (sorted by mean E[X])')
+    ax.set_ylabel('Activation Value')
+    title_text = (f'Sorted Per-Feature Statistics (n={in_features})\n'
+                  f'E[X]: [{E_X.min():.4f}, {E_X.max():.4f}]')
     ax.set_title(title_text, fontsize=10)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # 2. Sorted Variance
+    # 2. Sorted std per feature
     ax = axes[0, 1]
-    sorted_var = np.sort(variance)
-    ax.plot(sorted_var, linewidth=2, color='purple')
-    ax.axhline(np.mean(variance), color='red', linestyle='--', linewidth=2,
-               label=f'Mean: {np.mean(variance):.6f}')
-    ax.axhline(np.median(variance), color='green', linestyle='--', linewidth=2,
-               label=f'Median: {np.median(variance):.6f}')
-    ax.set_xlabel('Input Channel (sorted by Var[X])')
-    ax.set_ylabel('Var[X_j] = E[X_j²] - E[X_j]²')
-    title_text = (f'Sorted Variance\n'
-                  f'min={variance.min():.6f}, max={variance.max():.6f}, std={np.std(variance):.6f}')
+    sorted_std = np.sort(std_X)
+    ax.plot(sorted_std, linewidth=2, color='purple')
+    ax.axhline(np.mean(std_X), color='red', linestyle='--', linewidth=2,
+               label=f'Mean: {np.mean(std_X):.6f}')
+    ax.axhline(np.median(std_X), color='green', linestyle='--', linewidth=2,
+               label=f'Median: {np.median(std_X):.6f}')
+    ax.set_xlabel('Input Feature (sorted by std)')
+    ax.set_ylabel('std[X_j]')
+    title_text = (f'Sorted Std per Feature\n'
+                  f'min={std_X.min():.6f}, max={std_X.max():.6f}')
     ax.set_title(title_text, fontsize=10)
     ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.set_yscale('log')
 
-    # 3. E[X] distribution histogram
+    # 3. Distribution of per-feature means
     ax = axes[1, 0]
     ax.hist(E_X, bins=50, alpha=0.7, color='blue', edgecolor='black')
     ax.axvline(np.mean(E_X), color='red', linestyle='--', linewidth=2,
@@ -204,38 +222,37 @@ def visualize_activation_statistics(E_X, L2_norm_X, output_dir):
                label=f'Median: {np.median(E_X):.4f}')
     ax.set_xlabel('E[X_j]')
     ax.set_ylabel('Frequency')
-    title_text = (f'First Moment Distribution\n'
+    title_text = (f'Distribution of Per-Feature Means\n'
                   f'range=[{E_X.min():.4f}, {E_X.max():.4f}], std={E_X.std():.4f}')
     ax.set_title(title_text, fontsize=10)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # 4. Variance distribution histogram
+    # 4. Distribution of per-feature std
     ax = axes[1, 1]
-    ax.hist(variance, bins=50, alpha=0.7, color='purple', edgecolor='black')
-    ax.axvline(np.mean(variance), color='red', linestyle='--', linewidth=2,
-               label=f'Mean: {np.mean(variance):.6f}')
-    ax.axvline(np.median(variance), color='green', linestyle='--', linewidth=2,
-               label=f'Median: {np.median(variance):.6f}')
-    ax.set_xlabel('Var[X_j]')
+    ax.hist(std_X, bins=50, alpha=0.7, color='purple', edgecolor='black')
+    ax.axvline(np.mean(std_X), color='red', linestyle='--', linewidth=2,
+               label=f'Mean: {np.mean(std_X):.6f}')
+    ax.axvline(np.median(std_X), color='green', linestyle='--', linewidth=2,
+               label=f'Median: {np.median(std_X):.6f}')
+    ax.set_xlabel('std[X_j]')
     ax.set_ylabel('Frequency')
-    title_text = (f'Variance Distribution\n'
-                  f'range=[{variance.min():.6f}, {variance.max():.6f}], std={np.std(variance):.6f}')
+    title_text = (f'Distribution of Per-Feature Std\n'
+                  f'range=[{std_X.min():.6f}, {std_X.max():.6f}]')
     ax.set_title(title_text, fontsize=10)
     ax.legend()
     ax.grid(True, alpha=0.3)
-    ax.set_xscale('log')
 
     plt.tight_layout()
 
     # Save figure
     plot_path = os.path.join(output_dir, 'activation_statistics.png')
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    print(f"✅ Saved activation statistics: {plot_path}")
+    print(f"✅ Saved per-feature activation statistics: {plot_path}")
 
     plt.close()
 
-    return variance, std_dev
+    return min_X, max_X, std_X
 
 
 def visualize_pruning(W_original, W_pruned, scores, mask, E_X, L2_norm_X,
@@ -376,8 +393,24 @@ def main():
     E_X = data['E_X']
     L2_norm_X = data['L2_norm_X']
     JS_mean_X = data['JS_mean_X']
+    min_X = data.get('min_X')
+    max_X = data.get('max_X')
+    std_X = data.get('std_X')
 
     out_channel_id = args.out_channel_id
+
+    # Check if we have per-feature statistics
+    has_per_feature_stats = (min_X is not None) and (max_X is not None) and (std_X is not None)
+    if not has_per_feature_stats:
+        print("  ⚠️ Per-feature min/max/std not available (old export format)")
+        print("  ⚠️ Please re-run export_wd.py to generate new data with these statistics")
+        # Compute fallback std from L2 norm
+        E_X2 = L2_norm_X ** 2
+        variance = E_X2 - E_X ** 2
+        variance = np.maximum(variance, 0)
+        std_X = np.sqrt(variance)
+        min_X = np.full_like(E_X, np.nan)
+        max_X = np.full_like(E_X, np.nan)
 
     # Validate output channel
     if out_channel_id >= data['out_features']:
@@ -455,17 +488,35 @@ def main():
         f.write(f"Layer: {data['layer_name']}\n")
         f.write(f"Output channel: {out_channel_id}\n")
         f.write(f"Sparsity: {args.sparsity * 100:.1f}%\n")
-        f.write(f"\nActivation Statistics:\n")
-        f.write(f"  E[X] min: {E_X.min():.6f}\n")
-        f.write(f"  E[X] max: {E_X.max():.6f}\n")
-        f.write(f"  E[X] mean: {E_X.mean():.6f}\n")
-        f.write(f"  E[X] median: {np.median(E_X):.6f}\n")
-        f.write(f"  E[X] std: {E_X.std():.6f}\n")
-        f.write(f"  Var[X] min: {variance_for_results.min():.6f}\n")
-        f.write(f"  Var[X] max: {variance_for_results.max():.6f}\n")
-        f.write(f"  Var[X] mean: {variance_for_results.mean():.6f}\n")
-        f.write(f"  Var[X] median: {np.median(variance_for_results):.6f}\n")
-        f.write(f"  Var[X] std: {np.std(variance_for_results):.6f}\n")
+        f.write(f"\nPer-Feature Activation Statistics:\n")
+        f.write(f"  Mean per feature (E[X_j]):\n")
+        f.write(f"    min: {E_X.min():.6f}\n")
+        f.write(f"    max: {E_X.max():.6f}\n")
+        f.write(f"    mean: {E_X.mean():.6f}\n")
+        f.write(f"    median: {np.median(E_X):.6f}\n")
+        f.write(f"    std: {E_X.std():.6f}\n")
+        if has_per_feature_stats:
+            f.write(f"  Min per feature (min[X_j]):\n")
+            f.write(f"    global_min: {min_X.min():.6f}\n")
+            f.write(f"    global_max: {min_X.max():.6f}\n")
+            f.write(f"    mean: {min_X.mean():.6f}\n")
+            f.write(f"    median: {np.median(min_X):.6f}\n")
+            f.write(f"  Max per feature (max[X_j]):\n")
+            f.write(f"    global_min: {max_X.min():.6f}\n")
+            f.write(f"    global_max: {max_X.max():.6f}\n")
+            f.write(f"    mean: {max_X.mean():.6f}\n")
+            f.write(f"    median: {np.median(max_X):.6f}\n")
+            f.write(f"  Std per feature (std[X_j]):\n")
+            f.write(f"    min: {std_X.min():.6f}\n")
+            f.write(f"    max: {std_X.max():.6f}\n")
+            f.write(f"    mean: {std_X.mean():.6f}\n")
+            f.write(f"    median: {np.median(std_X):.6f}\n")
+        f.write(f"  Var[X] (computed from E[X²]-E[X]²):\n")
+        f.write(f"    min: {variance_for_results.min():.6f}\n")
+        f.write(f"    max: {variance_for_results.max():.6f}\n")
+        f.write(f"    mean: {variance_for_results.mean():.6f}\n")
+        f.write(f"    median: {np.median(variance_for_results):.6f}\n")
+        f.write(f"    std: {np.std(variance_for_results):.6f}\n")
         f.write(f"\nPruning Statistics:\n")
         f.write(f"  Channels kept: {num_kept}/{len(mask)}\n")
         f.write(f"  Channels pruned: {num_pruned}/{len(mask)}\n")
@@ -508,6 +559,9 @@ def main():
         'E[X^2]': E_X2,
         'Var[X]': variance_temp,
         'Std[X]': np.sqrt(variance_temp),
+        'min[X]': min_X,
+        'max[X]': max_X,
+        'std[X]_perfeature': std_X,
         'JS_mean[X]': JS_mean_X,
         'contribution_orig': W_row * E_X,
         'contribution_pruned': W_row_pruned * E_X,
@@ -518,19 +572,27 @@ def main():
     # Create visualizations
     print(f"\n📊 Creating visualizations...")
 
-    # Visualize activation statistics (E[X] and variance)
-    print(f"  Creating activation statistics plots...")
-    variance, std_dev = visualize_activation_statistics(E_X, L2_norm_X, args.output_dir)
+    # Visualize per-feature activation statistics
+    print(f"  Creating per-feature activation statistics plots...")
+    if has_per_feature_stats:
+        _, _, _ = visualize_activation_statistics(E_X, min_X, max_X, std_X, args.output_dir)
 
-    print(f"\n📈 Activation statistics:")
-    print(f"   E[X]:")
-    print(f"     min: {E_X.min():.6f}, max: {E_X.max():.6f}")
-    print(f"     mean: {E_X.mean():.6f}, median: {np.median(E_X):.6f}")
-    print(f"     std: {E_X.std():.6f}")
-    print(f"   Var[X]:")
-    print(f"     min: {variance.min():.6f}, max: {variance.max():.6f}")
-    print(f"     mean: {variance.mean():.6f}, median: {np.median(variance):.6f}")
-    print(f"     std: {np.std(variance):.6f}")
+        print(f"\n📈 Per-Feature Activation Statistics:")
+        print(f"   Mean per feature (E[X_j]):")
+        print(f"     min: {E_X.min():.6f}, max: {E_X.max():.6f}")
+        print(f"     mean: {E_X.mean():.6f}, median: {np.median(E_X):.6f}")
+        print(f"     std: {E_X.std():.6f}")
+        print(f"   Min per feature (min[X_j]):")
+        print(f"     global_min: {min_X.min():.6f}, global_max: {min_X.max():.6f}")
+        print(f"     mean: {min_X.mean():.6f}, median: {np.median(min_X):.6f}")
+        print(f"   Max per feature (max[X_j]):")
+        print(f"     global_min: {max_X.min():.6f}, global_max: {max_X.max():.6f}")
+        print(f"     mean: {max_X.mean():.6f}, median: {np.median(max_X):.6f}")
+        print(f"   Std per feature (std[X_j]):")
+        print(f"     min: {std_X.min():.6f}, max: {std_X.max():.6f}")
+        print(f"     mean: {std_X.mean():.6f}, median: {np.median(std_X):.6f}")
+    else:
+        print("  ⏭️  Skipping per-feature statistics visualization (data not available)")
 
     # Visualize pruning analysis
     print(f"  Creating pruning analysis plots...")

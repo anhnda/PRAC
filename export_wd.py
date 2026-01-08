@@ -5,13 +5,15 @@ Exports from a specific layer:
 1. W - Full weight matrix [out_features, in_features]
 2. E[X_j] - Mean activation per input channel j [in_features]
 3. ||X_j||_2 - L2 norm of activations per channel (for Wanda scoring) [in_features]
-4. James-Stein Estimator for E[X_j] [in_features]
+4. min[X_j], max[X_j], std[X_j] - Per-feature statistics [in_features]
+5. James-Stein Estimator for E[X_j] [in_features]
 
 This allows detailed analysis of:
 - Weight patterns across all output channels
-- Activation statistics per input channel
+- Activation statistics per input channel (mean, min, max, std)
 - Wanda pruning scores (|W_ij| * ||X_j||_2)
 - James-Stein shrinkage effect on activation means
+- Distribution of activation values per feature
 
 Usage:
     python export_wd.py --layer-id 3 --channel-id 0
@@ -173,6 +175,51 @@ class WandaDataExporter:
         return l2_norm
 
     @torch.no_grad()
+    def get_activation_min_max_std(self, name):
+        """
+        Compute min, max, and std per input channel.
+
+        Returns:
+            tuple: (min_vals, max_vals, std_vals) each of shape [in_features]
+        """
+        if name not in self.activation_data or len(self.activation_data[name]) == 0:
+            return None, None, None
+
+        X_list = self.activation_data[name]
+        in_features = X_list[0].shape[-1]
+
+        # Initialize with extreme values
+        min_vals = torch.full((in_features,), float('inf'), dtype=torch.float32)
+        max_vals = torch.full((in_features,), float('-inf'), dtype=torch.float32)
+
+        # For std, we need mean and squared sum
+        total_samples = sum(x.reshape(-1, x.shape[-1]).shape[0] for x in X_list)
+        mean_sum = torch.zeros(in_features, dtype=torch.float32)
+        squared_sum = torch.zeros(in_features, dtype=torch.float32)
+
+        for x in X_list:
+            x_flat = x.reshape(-1, x.shape[-1]).float()
+
+            # Update min and max
+            batch_min = x_flat.min(dim=0)[0]
+            batch_max = x_flat.max(dim=0)[0]
+            min_vals = torch.min(min_vals, batch_min)
+            max_vals = torch.max(max_vals, batch_max)
+
+            # Accumulate for std calculation
+            mean_sum += x_flat.sum(dim=0)
+            squared_sum += x_flat.pow(2).sum(dim=0)
+
+        # Compute mean and std
+        mean_vals = mean_sum / total_samples
+        # Var = E[X²] - E[X]²
+        variance = (squared_sum / total_samples) - (mean_vals ** 2)
+        variance = torch.clamp(variance, min=0)  # Ensure non-negative
+        std_vals = torch.sqrt(variance)
+
+        return min_vals, max_vals, std_vals
+
+    @torch.no_grad()
     def export_layer_data(self, layer_name, module, channel_id=0):
         """
         Export weight and activation data for a specific layer.
@@ -203,6 +250,9 @@ class WandaDataExporter:
         # Get L2 norm ||X_j||_2
         activation_l2_norm = self.get_activation_l2_norm(layer_name)
 
+        # Get min, max, std per input channel
+        activation_min, activation_max, activation_std = self.get_activation_min_max_std(layer_name)
+
         # Compute James-Stein estimator
         js_mean = compute_james_stein_mean(activation_mean)
 
@@ -223,6 +273,9 @@ class WandaDataExporter:
             'E[X]': activation_mean.numpy(),  # Shape: [in_features]
             'L2_norm[X]': activation_l2_norm.numpy(),  # Shape: [in_features]
             'JS_mean[X]': js_mean.numpy(),  # Shape: [in_features]
+            'min[X]': activation_min.numpy(),  # Shape: [in_features]
+            'max[X]': activation_max.numpy(),  # Shape: [in_features]
+            'std[X]': activation_std.numpy(),  # Shape: [in_features]
 
             # Metadata
             'grand_mean': grand_mean.item(),
@@ -233,6 +286,10 @@ class WandaDataExporter:
         print(f"   ✅ Exported activation stats: [{in_features}]")
         print(f"   Grand mean: {grand_mean:.6f}")
         print(f"   JS shrinkage amount: {shrinkage_amount:.6f}")
+        print(f"   Per-feature stats:")
+        print(f"     min range: [{activation_min.min():.6f}, {activation_min.max():.6f}]")
+        print(f"     max range: [{activation_max.min():.6f}, {activation_max.max():.6f}]")
+        print(f"     std range: [{activation_std.min():.6f}, {activation_std.max():.6f}]")
 
         return export_dict
 
