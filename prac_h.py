@@ -391,6 +391,7 @@ class WandaPrunerWithGreedyHessian:
         # Greedy correction: process each candidate position
         num_applied = 0
         stopped_early = False
+        position_improvements = []  # Track improvement per position for diagnostics
 
         for idx, j in enumerate(candidate_positions):
             j_item = j.item()
@@ -429,6 +430,14 @@ class WandaPrunerWithGreedyHessian:
             improvement_neg = -delta_error_neg[neg_improves].sum().item() if neg_improves.any() else 0.0
             total_improvement = improvement_pos + improvement_neg
 
+            # Diagnostic: track linear vs quadratic terms
+            if debug and total_improvement > 0:
+                # Average linear term contribution (2δP)
+                linear_term_pos = (2 * deltas[pos_improves] * dot_products[pos_improves]).abs().mean().item() if pos_improves.any() else 0
+                linear_term_neg = (2 * deltas[neg_improves] * dot_products[neg_improves]).abs().mean().item() if neg_improves.any() else 0
+                # Average quadratic penalty (δ²||X||²)
+                quad_term = (deltas[pos_improves | neg_improves] ** 2).mean().item() * X_j_norm_sq.item() if (pos_improves | neg_improves).any() else 0
+
             if total_improvement > 0:
                 # Apply corrections vectorized - no Python loops!
                 if pos_improves.any():
@@ -447,9 +456,30 @@ class WandaPrunerWithGreedyHessian:
                 num_applied += 1
                 num_channels_corrected = pos_improves.sum().item() + neg_improves.sum().item()
 
+                # VERIFICATION: Check if incremental error matches actual error
                 if debug and num_applied <= 3:
+                    actual_error = (R ** 2).sum().item()
+                    error_diff = abs(actual_error - error_current)
+                    if error_diff > 1e-3:
+                        print(f"      ⚠️  ERROR MISMATCH! Tracked={error_current:.6e}, Actual={actual_error:.6e}, Diff={error_diff:.6e}")
+
+                # Track for diagnostics
+                position_improvements.append({
+                    'position': idx,
+                    'j': j_item,
+                    'improvement': total_improvement,
+                    'num_channels': num_channels_corrected,
+                    'error_after': error_current,
+                })
+
+                if debug and num_applied <= 5:
+                    linear_avg = (linear_term_pos + linear_term_neg) / 2 if (linear_term_pos + linear_term_neg) > 0 else 0
+                    # Show ratio of quad penalty to linear benefit
+                    penalty_ratio = quad_term / linear_avg if linear_avg > 0 else 0
                     print(f"      Position {idx+1}/{len(candidate_positions)}: j={j_item}, "
-                          f"channels={num_channels_corrected}, improvement={total_improvement:.6e}, error={error_current:.6e}")
+                          f"channels={num_channels_corrected}, improvement={total_improvement:.6e}")
+                    print(f"        Linear benefit: {linear_avg:.6e}, Quad penalty: {quad_term:.6e}, "
+                          f"Penalty ratio: {penalty_ratio:.3f}, Error: {error_current:.6e}")
             else:
                 # No improvement, stop
                 stopped_early = True
@@ -464,6 +494,13 @@ class WandaPrunerWithGreedyHessian:
         error_final = error_current
         error_reduction = error_initial - error_final
 
+        # Compute diminishing returns statistics
+        improvement_trend = None
+        if len(position_improvements) > 1:
+            first_half_avg = sum(p['improvement'] for p in position_improvements[:len(position_improvements)//2]) / (len(position_improvements)//2)
+            second_half_avg = sum(p['improvement'] for p in position_improvements[len(position_improvements)//2:]) / (len(position_improvements) - len(position_improvements)//2)
+            improvement_trend = second_half_avg / first_half_avg if first_half_avg > 0 else 0
+
         correction_stats = {
             'error_before_mean': error_initial,
             'error_after_mean': error_final,
@@ -472,6 +509,8 @@ class WandaPrunerWithGreedyHessian:
             'num_applied': num_applied,
             'stopped_early': stopped_early,
             'apply_percentage': num_applied / len(candidate_positions) * 100 if len(candidate_positions) > 0 else 0,
+            'improvement_trend': improvement_trend,  # Ratio of 2nd half to 1st half improvements
+            'position_improvements': position_improvements,
         }
 
         if debug:
@@ -479,8 +518,12 @@ class WandaPrunerWithGreedyHessian:
             print(f"    Error after: {error_final:.6e}")
             print(f"    Reduction: {error_reduction:.6e} ({error_reduction/error_initial*100 if error_initial > 0 else 0:.2f}%)")
             print(f"    Applied: {num_applied}/{len(candidate_positions)} ({correction_stats['apply_percentage']:.1f}%)")
+            if improvement_trend is not None:
+                print(f"    Diminishing returns: 2nd half avg / 1st half avg = {improvement_trend:.3f}")
+                if improvement_trend < 0.5:
+                    print(f"      ⚠️  Improvements dropped by >50% - consider reducing correction magnitude!")
             if stopped_early:
-                print(f"    Status: Early stopping (corrections stopped helping)")
+                print(f"    Status: Early stopping at position {num_applied}/{len(candidate_positions)}")
             else:
                 print(f"    Status: Applied all candidate corrections")
 
