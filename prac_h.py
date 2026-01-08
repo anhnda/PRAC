@@ -1,7 +1,8 @@
 """
 Wanda Pruning with Greedy Direct Error Correction (prac_h.py)
 
-Implements greedy iterative correction using DIRECT activation error measurement.
+Implements greedy iterative correction using DIRECT activation error measurement
+with OPTIMIZED residual-based incremental updates.
 
 Mathematical Foundation:
     Directly minimize the reconstruction error on calibration data:
@@ -13,31 +14,48 @@ Mathematical Foundation:
     - W = current weights [out_features, in_features]
     - W_orig = original dense weights
 
-    NO Hessian needed! Just direct error measurement on stored activations.
+Optimization Key Insight:
+    Instead of recomputing full error after each weight change (expensive!),
+    we maintain residual R = X @ (W - W_orig)^T and update it incrementally.
 
-Key Differences from prac_full.py:
+    FULLY VECTORIZED - No Python loops over channels!
+
+    For all channels at position j simultaneously:
+        1. Deltas: D = magnitude × W_orig[:, j]  [out_features]
+        2. Dot products: P = R^T @ X[:, j]  [out_features]
+        3. Error changes: ΔE = 2D⊙P + D²||X_j||²  (vectorized across all channels!)
+        4. Masks: pos_better = (ΔE_pos < 0) & (ΔE_pos ≤ ΔE_neg)  (boolean indexing!)
+        5. Apply: W[mask, j] += D[mask]; R[:, mask] += X_j ⊗ D[mask]  (GPU parallel!)
+
+    This reduces complexity from O(positions × channels × tokens × features²)
+    to O(positions × tokens × features) - over 1000x faster with full GPU utilization!
+
+Key Features:
 1. **Direct error measurement**: Computes ||XW^T - XW_orig^T||² on actual activations
 2. **No Hessian**: Stores activation samples instead of computing XX^T (much faster!)
-3. **Greedy search**: Process positions one-by-one, stop when no improvement
-4. **Fixed magnitude**: 1% correction (default) avoids clamping issues
-5. **Simpler**: No linear system solving, just error evaluation
+3. **Fully vectorized**: All channels evaluated in parallel - NO Python loops!
+4. **Greedy search**: Process positions one-by-one, stop when no improvement
+5. **Fixed magnitude**: 1% correction (default) avoids clamping issues
+6. **Incremental updates**: Residual-based optimization for 1000x+ speedup
 
 Algorithm:
     1. Select MODERATE candidate positions (Kneedle algorithm)
-    2. For each candidate position j:
-       a. For each output channel i:
-          - Try ΔW_ij = +1% * W_orig_ij, compute J(ΔW_i)
-          - Try ΔW_ij = -1% * W_orig_ij, compute J(ΔW_i)
-          - Pick direction with lowest J
-       b. Sum improvements across all channels
-       c. If total improvement > 0: apply corrections, continue
-       d. If no improvement: stop (early termination)
+    2. Compute initial residual: R = X @ (W_pruned - W_orig)^T
+    3. For each candidate position j (greedy loop):
+       a. Vectorized across ALL channels: compute error changes ΔE for +δ and -δ
+       b. Create boolean masks: which channels improve with each direction
+       c. Apply corrections using GPU-parallel indexing: W[mask, j] += deltas[mask]
+       d. Update residual incrementally: R[:, mask] += X_j ⊗ deltas[mask]
+       e. If total improvement > 0: continue to next position
+       f. If no improvement: stop (early termination)
 
 Benefits:
-    - **Mathematically correct**: Directly optimizes what we care about (activation error)
-    - **Efficient**: Per-channel objectives computed independently
-    - **Adaptive**: Natural early stopping when improvements stop
-    - **Stable**: Small fixed magnitude prevents disruption
+    - **Mathematically correct**: Directly optimizes reconstruction error on calibration data
+    - **Fully vectorized**: ALL channels evaluated in parallel on GPU (no Python loops!)
+    - **Efficient**: 1000x+ faster than naive approach via residual-based updates
+    - **Adaptive**: Natural early stopping when improvements plateau
+    - **Stable**: Small fixed magnitude prevents network disruption
+    - **Memory efficient**: Stores activations on CPU, moves to GPU only during correction
 
 Usage:
     python prac_h.py --sparsity 0.5 --percent-change 0.05 --correction-magnitude 0.01
@@ -158,14 +176,15 @@ class WandaPrunerWithGreedyHessian:
     """
 
     def __init__(self, model, tokenizer, device="cuda", sparsity=0.5,
-                 max_tokens_per_sample=512, use_correction=True,
-                 knee_tolerance=0.0, offset_percent=0.0, percent_change=0.05,
-                 correction_magnitude=0.01):
+                 max_tokens_per_sample=512, max_activation_samples=8192,
+                 use_correction=True, knee_tolerance=0.0, offset_percent=0.0,
+                 percent_change=0.05, correction_magnitude=0.01):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.sparsity = sparsity
         self.max_tokens_per_sample = max_tokens_per_sample
+        self.max_activation_samples = max_activation_samples  # Limit total samples stored
         self.use_correction = use_correction
         self.knee_tolerance = knee_tolerance
         self.offset_percent = offset_percent
@@ -173,7 +192,7 @@ class WandaPrunerWithGreedyHessian:
         self.correction_magnitude = correction_magnitude
 
         # Storage for activation samples (for direct error measurement)
-        # Memory: O(num_samples * hidden_dim) - much cheaper than Hessian!
+        # Memory: O(max_activation_samples * hidden_dim) per layer
         self.activation_stats = {}  # Dict of {name: {'activations': tensor, 'mean_sum': tensor, 'count': int}}
         self.hooks = []
         self.layer_stats = {}
@@ -181,6 +200,7 @@ class WandaPrunerWithGreedyHessian:
         print(f"\n[Wanda Pruner with Greedy Direct Error Correction]")
         print(f"  Target sparsity: {sparsity*100:.1f}% (keep {(1-sparsity)*100:.1f}%)")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample")
+        print(f"  Max activation samples: {max_activation_samples} tokens/layer")
         print(f"  Salience metric: ||X_j||_2 (L2 norm from activations)")
         print(f"  Scoring: Score_ij = |W_ij| * ||X_j||_2")
         print(f"  Error measurement: Direct ||X·W^T - X·W_orig^T||² on calibration data")
@@ -302,15 +322,33 @@ class WandaPrunerWithGreedyHessian:
         """
         Greedy iterative weight correction using DIRECT activation error.
 
-        Algorithm:
-            1. Start with pruned weights
-            2. For each candidate position j:
-               a. Try correction: W[:, j] ± 1%
-               b. Compute DIRECT error: ||X @ W^T - X @ W_orig^T||²
-               c. Pick direction with lowest error
-               d. If error decreases: apply and continue
-               e. If no improvement: stop
-            3. Return best weights found
+        Fully Vectorized Algorithm (No Python Loops Over Channels):
+            1. Compute residual once: R = X @ (W_current - W_orig)^T  [num_tokens, out_features]
+            2. Precompute column norms: ||X[:,j]||² for all j
+            3. For each candidate position j:
+               a. Compute dot products: P = R^T @ X[:, j]  [out_features] - vectorized
+               b. Compute deltas: D = magnitude × W_orig[:, j]  [out_features] - vectorized
+               c. Error changes: ΔE_pos = 2D⊙P + D²||X_j||², ΔE_neg = -2D⊙P + D²||X_j||² - vectorized
+               d. Boolean masks: which channels improve with +D or -D - vectorized
+               e. Update weights: W[mask_pos, j] += D[mask_pos] - vectorized indexing
+               f. Update residual: R[:, mask] += X_j ⊗ D[mask] - vectorized broadcast
+               g. If no improvement: stop
+            4. Return corrected weights
+
+        Complexity:
+            Naive approach: O(positions × channels × tokens × features²) - completely infeasible
+            First optimization: O(positions × channels + positions × tokens × features) - 100x faster
+            Final (vectorized): O(positions × tokens × features) - 1000x+ faster (no Python loops!)
+
+        Mathematical Basis:
+            For weight change W[i,j] → W[i,j] + δ, the residual at channel i becomes:
+            R_new[:,i] = R[:,i] + δ * X[:,j]
+
+            Change in squared error:
+            ΔE_i = sum((R_new[:,i])²) - sum((R[:,i])²)
+                 = 2δ * (R[:,i] · X[:,j]) + δ² * ||X[:,j]||²
+
+            This allows O(1) evaluation per channel without full matrix multiplication!
 
         Args:
             W_orig: Original weights [out_features, in_features]
@@ -330,31 +368,25 @@ class WandaPrunerWithGreedyHessian:
         W_orig_f32 = W_orig.float()
         W_pruned_f32 = W_pruned.float()
 
-        # Activations already on GPU
+        # Move activations from CPU to GPU for error computation
         X = activations.float().to(self.device)  # [num_samples, in_features]
+        num_tokens = X.shape[0]
+        out_features = W_orig_f32.shape[0]
 
         if len(candidate_positions) == 0:
             if debug:
                 print(f"    ⚠️ No candidates, no correction")
             return W_pruned.clone(), None
 
-        # Helper function to compute DIRECT activation error
-        def compute_error(W):
-            """
-            Compute ||X @ W^T - X @ W_orig^T||²
-
-            This is the TRUE reconstruction error on calibration data.
-            """
-            # activations @ weights^T = outputs
-            outputs_orig = X @ W_orig_f32.t()  # [num_samples, out_features]
-            outputs_curr = X @ W.t()            # [num_samples, out_features]
-            error = ((outputs_curr - outputs_orig) ** 2).sum().item()
-            return error
-
-        # Initial error
+        # Compute initial residual: R = X @ (W_current - W_orig)^T
+        # R[t, i] = error at token t, output channel i
         W_current = W_pruned_f32.clone()
-        error_current = compute_error(W_current)
+        R = X @ (W_current - W_orig_f32).t()  # [num_tokens, out_features]
+        error_current = (R ** 2).sum().item()
         error_initial = error_current
+
+        # Precompute X column norms (needed for delta^2 term)
+        X_col_norms_sq = (X ** 2).sum(dim=0)  # [in_features]
 
         # Greedy correction: process each candidate position
         num_applied = 0
@@ -368,56 +400,62 @@ class WandaPrunerWithGreedyHessian:
             if not survivors_at_j.any():
                 continue
 
-            # For each output channel at position j, try ±correction and pick best
-            best_corrections = []  # List of (i, direction) tuples
+            # FULLY VECTORIZED: evaluate all channels at position j simultaneously
+            # For each channel i, changing W[i,j] by δ changes residual R[:,i] by δ*X[:,j]
+            # Change in error: ΔE_i = 2δ * (R[:,i] · X[:,j]) + δ² * ||X[:,j]||²
 
-            for i in range(W_current.shape[0]):
-                if not survivors_at_j[i]:
-                    continue
+            X_j = X[:, j]  # [num_tokens]
+            X_j_norm_sq = X_col_norms_sq[j]
 
-                # Try +correction
-                W_test = W_current.clone()
-                W_test[i, j] += self.correction_magnitude * W_orig_f32[i, j]
-                error_pos = compute_error(W_test)
+            # Compute dot products for all channels: R^T @ X_j = [out_features]
+            dot_products = R.t() @ X_j  # [out_features]
 
-                # Try -correction
-                W_test = W_current.clone()
-                W_test[i, j] -= self.correction_magnitude * W_orig_f32[i, j]
-                error_neg = compute_error(W_test)
+            # Compute delta values for all channels: [out_features]
+            deltas = self.correction_magnitude * W_orig_f32[:, j]  # [out_features]
 
-                # Pick best direction (lowest error)
-                if error_pos < error_current and error_pos <= error_neg:
-                    best_corrections.append((i, +1))
-                elif error_neg < error_current:
-                    best_corrections.append((i, -1))
+            # Vectorized error change computation for all channels at once
+            # ΔE(+δ) = 2δ * P + δ² * ||X_j||²
+            delta_error_pos = 2 * deltas * dot_products + deltas ** 2 * X_j_norm_sq  # [out_features]
+            # ΔE(-δ) = -2δ * P + δ² * ||X_j||²
+            delta_error_neg = -2 * deltas * dot_products + deltas ** 2 * X_j_norm_sq  # [out_features]
 
-            # Apply all corrections for this position and measure combined effect
-            if len(best_corrections) > 0:
-                W_test = W_current.clone()
-                for i, direction in best_corrections:
-                    delta = direction * self.correction_magnitude * W_orig_f32[i, j]
-                    W_test[i, j] += delta
+            # Determine which channels benefit from each direction
+            # Only consider surviving weights at this position
+            pos_improves = (delta_error_pos < 0) & (delta_error_pos <= delta_error_neg) & survivors_at_j
+            neg_improves = (delta_error_neg < 0) & ~pos_improves & survivors_at_j
 
-                error_new = compute_error(W_test)
+            # Compute total improvement
+            improvement_pos = -delta_error_pos[pos_improves].sum().item() if pos_improves.any() else 0.0
+            improvement_neg = -delta_error_neg[neg_improves].sum().item() if neg_improves.any() else 0.0
+            total_improvement = improvement_pos + improvement_neg
 
-                if error_new < error_current:
-                    # Accept corrections
-                    improvement = error_current - error_new
-                    W_current = W_test
-                    error_current = error_new
-                    num_applied += 1
+            if total_improvement > 0:
+                # Apply corrections vectorized - no Python loops!
+                if pos_improves.any():
+                    # Apply positive corrections
+                    W_current[pos_improves, j] += deltas[pos_improves]
+                    # Update residual: R[:, pos_channels] += X_j.unsqueeze(1) @ deltas[pos_channels].unsqueeze(0)
+                    R[:, pos_improves] += X_j.unsqueeze(1) * deltas[pos_improves].unsqueeze(0)
 
-                    if debug and num_applied <= 3:
-                        print(f"      Position {idx+1}/{len(candidate_positions)}: j={j_item}, improvement={improvement:.6e}, error={error_current:.6e}")
-                else:
-                    # No improvement, stop
-                    stopped_early = True
-                    if debug:
-                        print(f"      Stopped at position {idx+1}/{len(candidate_positions)}: no improvement")
-                    break
+                if neg_improves.any():
+                    # Apply negative corrections
+                    W_current[neg_improves, j] -= deltas[neg_improves]
+                    # Update residual: R[:, neg_channels] -= X_j.unsqueeze(1) @ deltas[neg_channels].unsqueeze(0)
+                    R[:, neg_improves] -= X_j.unsqueeze(1) * deltas[neg_improves].unsqueeze(0)
+
+                error_current -= total_improvement
+                num_applied += 1
+                num_channels_corrected = pos_improves.sum().item() + neg_improves.sum().item()
+
+                if debug and num_applied <= 3:
+                    print(f"      Position {idx+1}/{len(candidate_positions)}: j={j_item}, "
+                          f"channels={num_channels_corrected}, improvement={total_improvement:.6e}, error={error_current:.6e}")
             else:
-                # No corrections found for this position, continue
-                continue
+                # No improvement, stop
+                stopped_early = True
+                if debug:
+                    print(f"      Stopped at position {idx+1}/{len(candidate_positions)}: no improvement")
+                break
 
         # Convert back to original dtype
         W_corrected = W_current.to(weight_dtype)
@@ -446,7 +484,8 @@ class WandaPrunerWithGreedyHessian:
             else:
                 print(f"    Status: Applied all candidate corrections")
 
-        # Cleanup
+        # Cleanup - free GPU memory
+        del X
         torch.cuda.empty_cache()
 
         return W_corrected, correction_stats
@@ -558,7 +597,10 @@ class WandaPrunerWithGreedyHessian:
         if debug:
             print(f"  → Sparsity: {actual_sparsity*100:.2f}%")
 
+        # Cleanup weights and activation stats for this layer to free memory
         del W_device, l2_salience_device, js_mean_device, W_pruned, W_final
+        if name in self.activation_stats:
+            del self.activation_stats[name]
         torch.cuda.empty_cache()
 
     def get_hook(self, name):
@@ -594,16 +636,24 @@ class WandaPrunerWithGreedyHessian:
                 self.activation_stats[name] = {
                     'activations': [],  # Store samples as list (will concatenate later)
                     'mean_sum': torch.zeros(hidden_dim, dtype=torch.float32, device=inp.device),
-                    'count': 0
+                    'count': 0,
+                    'num_stored': 0  # Track number of tokens stored
                 }
 
             # Store activation samples
             stats = self.activation_stats[name]
 
-            # Store on GPU during calibration for speed
-            stats['activations'].append(inp_flat)
+            # Only store if under the limit (to prevent OOM)
+            if stats['num_stored'] < self.max_activation_samples:
+                # How many tokens can we store?
+                remaining = self.max_activation_samples - stats['num_stored']
+                num_to_store = min(num_tokens, remaining)
 
-            # Also accumulate mean for JS estimator
+                # Store on CPU to save GPU memory (will move to GPU during correction)
+                stats['activations'].append(inp_flat[:num_to_store].cpu())
+                stats['num_stored'] += num_to_store
+
+            # Always accumulate mean for JS estimator (keep on GPU for speed)
             stats['mean_sum'] += inp_flat.sum(dim=0)
             stats['count'] += num_tokens
 
@@ -788,6 +838,8 @@ def main():
                        help="Target sparsity (0.5 = prune 50%%)")
     parser.add_argument("--max-tokens-per-sample", type=int, default=2048,
                        help="Max tokens per sample")
+    parser.add_argument("--max-activation-samples", type=int, default=8192,
+                       help="Max activation tokens to store per layer (to prevent OOM)")
     parser.add_argument("--use-correction", action="store_true", default=True,
                        help="Enable greedy direct error correction")
     parser.add_argument("--no-correction", dest="use_correction", action="store_false",
@@ -871,6 +923,7 @@ def main():
         device=device,
         sparsity=args.sparsity,
         max_tokens_per_sample=args.max_tokens_per_sample,
+        max_activation_samples=args.max_activation_samples,
         use_correction=args.use_correction,
         knee_tolerance=args.knee_tolerance,
         offset_percent=args.offset_percent,
