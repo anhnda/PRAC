@@ -140,7 +140,8 @@ class WandaPrunerWithFullHessian:
     def __init__(self, model, tokenizer, device="cuda", sparsity=0.5,
                  max_tokens_per_sample=512, use_correction=True,
                  knee_tolerance=0.0, offset_percent=0.0, percent_change=0.05,
-                 max_correction_magnitude=0.05, damping=1e-5):
+                 max_correction_magnitude=0.05, damping=1e-5,
+                 selection_strategy='top'):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -152,6 +153,7 @@ class WandaPrunerWithFullHessian:
         self.percent_change = percent_change
         self.max_correction_magnitude = max_correction_magnitude
         self.damping = damping
+        self.selection_strategy = selection_strategy.lower()
 
         # Storage for full Hessian matrices
         # Memory: O(hidden_dim^2) per layer - stored on CPU to save GPU memory
@@ -168,7 +170,7 @@ class WandaPrunerWithFullHessian:
         print(f"  Damping: {damping} (for numerical stability)")
         if use_correction:
             print(f"  Full Hessian correction: ENABLED")
-            print(f"    - Selection strategy: TOP surviving weights")
+            print(f"    - Selection strategy: {selection_strategy.upper()} surviving weights")
             print(f"    - Correction percent: {percent_change*100:.1f}% of weights")
             print(f"    - Max magnitude: {max_correction_magnitude*100:.1f}% of original weight")
             print(f"    - Solver: Cholesky decomposition (Normal Equations)")
@@ -208,16 +210,13 @@ class WandaPrunerWithFullHessian:
     @torch.no_grad()
     def select_moderate_positions(self, js_mean, prune_mask, debug=False):
         """
-        Select TOP surviving weights for Full Hessian correction.
+        Select weights for Full Hessian correction based on strategy.
 
-        RATIONALE: Full Hessian correction is a second-order optimization that leverages
-        the correlation structure between weights. TOP weights (highest salience) have:
-        1. Strongest correlation with pruned channels
-        2. Highest energy to compensate for lost signal
-        3. Most capacity to absorb corrections without destabilizing
+        Strategies:
+        - 'top': Select TOP-N weights (highest salience). Theory: Most capacity to compensate.
+        - 'moderate': Select middle weights (after knee point). Theory: Balance between capacity and stability.
 
-        This differs from the diagonal/moderate approach where we avoided top weights
-        to prevent over-correction. The Hessian naturally regularizes corrections.
+        IMPORTANT: If perplexity increases with 'top', try 'moderate' or increase damping!
         """
         # Count surviving weights per input channel
         survival_count = prune_mask.sum(dim=0)  # [in_features]
@@ -237,38 +236,48 @@ class WandaPrunerWithFullHessian:
         sorted_indices = surviving_indices[sorted_order]
 
         num_surviving = len(surviving_indices)
-
-        # Select TOP-N weights (highest salience)
-        # For full Hessian, we want the weights with most capacity
         num_to_select = max(1, int(self.percent_change * num_surviving))
 
-        # Always start from index 0 (top weights)
-        start_idx = 0
-        end_idx = min(num_to_select, num_surviving)
+        if self.selection_strategy == 'top':
+            # Select TOP-N weights (highest salience)
+            start_idx = 0
+            end_idx = min(num_to_select, num_surviving)
+            selected_indices = sorted_indices[start_idx:end_idx]
+            strategy_name = 'TOP'
+        else:  # 'moderate'
+            # Apply Kneedle on first half to find moderate region
+            first_half = sorted_values[:num_surviving // 2]
+            if len(first_half) >= 3:
+                knee_idx = find_knee_point(first_half, tolerance_offset=self.knee_tolerance)
+                offset_indices = int(self.offset_percent * num_surviving)
+                start_idx = knee_idx + offset_indices
+                start_idx = max(0, min(start_idx, num_surviving - 1))
+            else:
+                start_idx = 0
 
-        # Get TOP indices
-        selected_indices = sorted_indices[start_idx:end_idx]
+            end_idx = min(start_idx + num_to_select, num_surviving)
+            if end_idx == num_surviving and start_idx > 0:
+                start_idx = max(0, num_surviving - num_to_select)
 
-        # For compatibility with stats tracking, compute a "pseudo knee"
-        # This is just the transition point where we stop selecting
-        knee_idx = end_idx
-        knee_value = sorted_values[min(knee_idx, len(sorted_values) - 1)].item() if len(sorted_values) > 0 else 0
+            selected_indices = sorted_indices[start_idx:end_idx]
+            strategy_name = 'MODERATE'
 
         knee_info = {
-            'knee_idx': knee_idx,
-            'knee_value': knee_value,
+            'knee_idx': end_idx,
+            'knee_value': sorted_values[min(end_idx, len(sorted_values) - 1)].item() if len(sorted_values) > 0 else 0,
             'start_idx': start_idx,
             'end_idx': end_idx,
             'num_selected': end_idx - start_idx,
             'num_surviving': num_surviving,
             'selection_pct': (end_idx - start_idx) / num_surviving * 100 if num_surviving > 0 else 0,
-            'selection_strategy': 'TOP',
+            'selection_strategy': strategy_name,
         }
 
         if debug:
             print(f"    Surviving channels: {num_surviving}")
-            print(f"    TOP selection: {knee_info['num_selected']} positions ({knee_info['selection_pct']:.2f}%)")
-            print(f"    Salience range: [{sorted_values[0].item():.6f}, {sorted_values[end_idx-1].item():.6f}]")
+            print(f"    {strategy_name} selection: {knee_info['num_selected']} positions ({knee_info['selection_pct']:.2f}%)")
+            if end_idx > 0:
+                print(f"    Salience range: [{sorted_values[start_idx].item():.6f}, {sorted_values[end_idx-1].item():.6f}]")
 
         return selected_indices, knee_info
 
@@ -778,6 +787,9 @@ def main():
                        help="Max correction magnitude as fraction of original weight (default 5%%)")
     parser.add_argument("--damping", type=float, default=1e-5,
                        help="Damping factor for Hessian (numerical stability)")
+    parser.add_argument("--selection-strategy", type=str, default="moderate",
+                       choices=["top", "moderate"],
+                       help="Weight selection strategy: 'top' for highest salience, 'moderate' for middle range")
     parser.add_argument("--output-dir", type=str, default="./pruned_models/model_prac_full",
                        help="Output directory")
     parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
@@ -855,7 +867,8 @@ def main():
         offset_percent=args.offset_percent,
         percent_change=args.percent_change,
         max_correction_magnitude=args.max_correction_magnitude,
-        damping=args.damping
+        damping=args.damping,
+        selection_strategy=args.selection_strategy
     )
 
     # Prune model
