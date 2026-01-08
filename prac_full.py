@@ -338,54 +338,51 @@ class WandaPrunerWithFullHessian:
         # Add damping for numerical stability: H_sub = H_sub + λI
         H_sub = H_sub + self.damping * torch.eye(len(selected_positions), device=self.device)
 
-        # Prepare to solve for each output channel
+        # Vectorized solution for all output channels at once
         W_corrected = W_pruned_f32.clone()
-        num_clamped = 0
-        total_corrections = 0
         solve_failures = 0
 
-        # For each output channel, solve the linear system
-        for i in range(W_orig.shape[0]):
-            # Only solve if this channel has surviving weights at selected positions
-            survivors_at_selected = prune_mask[i, selected_positions]
+        # Build RHS matrix: [out_features, num_selected]
+        # Each row i has: -error[i] for all selected positions
+        out_features = W_orig.shape[0]
+        num_selected = len(selected_positions)
+        RHS = torch.ones(out_features, num_selected, device=self.device) * (-errors.unsqueeze(1))
 
-            if not survivors_at_selected.any():
-                continue
+        try:
+            # Solve: H_sub @ Delta^T = RHS^T
+            # where Delta is [out_features, num_selected]
+            # Using Cholesky decomposition for stability
+            L = torch.linalg.cholesky(H_sub)
+            # cholesky_solve expects (B, A) and solves A @ X = B
+            # We need H_sub @ Delta^T = RHS^T
+            # So we pass RHS^T as B: [num_selected, out_features]
+            delta_W_all = torch.cholesky_solve(RHS.t().unsqueeze(-1), L).squeeze(-1).t()
+            # delta_W_all is now [out_features, num_selected]
 
-            # RHS: -error[i] for all selected positions where weight survived
-            # We want to distribute the error correction across selected positions
-            rhs = torch.ones(len(selected_positions), device=self.device) * (-errors[i])
+        except RuntimeError as e:
+            # If Cholesky fails, fall back to lstsq (more robust but slower)
+            if debug:
+                print(f"    ⚠️ Cholesky failed, using lstsq: {e}")
+            delta_W_all = torch.linalg.lstsq(H_sub, RHS.t()).solution.t()
+            solve_failures = 1
 
-            try:
-                # Solve: H_sub @ delta = rhs
-                # Using Cholesky decomposition for stability (requires H_sub to be positive definite)
-                L = torch.linalg.cholesky(H_sub)
-                delta_W_selected = torch.cholesky_solve(rhs.unsqueeze(1), L).squeeze(1)
+        # Apply magnitude constraint: |ΔW[i,j]| ≤ max_correction_magnitude * |W_orig[i,j]|
+        # max_change: [out_features, num_selected]
+        max_change = self.max_correction_magnitude * W_orig_f32[:, selected_positions].abs()
+        delta_W_clamped = torch.clamp(delta_W_all, -max_change, max_change)
 
-                # Alternative: Use direct solve if Cholesky fails
-                # delta_W_selected = torch.linalg.solve(H_sub, rhs)
+        # Only apply to surviving weights
+        # survivors_mask: [out_features, num_selected]
+        survivors_mask = prune_mask[:, selected_positions].float()
+        delta_W_masked = delta_W_clamped * survivors_mask
 
-            except RuntimeError as e:
-                # If Cholesky fails, fall back to lstsq (more robust but slower)
-                if debug and solve_failures == 0:
-                    print(f"    ⚠️ Cholesky failed for channel {i}, using lstsq: {e}")
-                delta_W_selected = torch.linalg.lstsq(H_sub, rhs.unsqueeze(1)).solution.squeeze(1)
-                solve_failures += 1
+        # Track clamping statistics
+        was_clamped = ((delta_W_all.abs() > max_change) & (survivors_mask > 0))
+        num_clamped = was_clamped.sum().item()
+        total_corrections = (survivors_mask > 0).sum().item()
 
-            # Apply magnitude constraint: |ΔW[i,j]| ≤ max_correction_magnitude * |W_orig[i,j]|
-            max_change = self.max_correction_magnitude * W_orig_f32[i, selected_positions].abs()
-            delta_W_clamped = torch.clamp(delta_W_selected, -max_change, max_change)
-
-            # Only apply to surviving weights
-            delta_W_masked = delta_W_clamped * survivors_at_selected.float()
-
-            # Track clamping
-            was_clamped = ((delta_W_selected.abs() > max_change) & survivors_at_selected).sum().item()
-            num_clamped += was_clamped
-            total_corrections += survivors_at_selected.sum().item()
-
-            # Apply correction (keep on same device)
-            W_corrected[i, selected_positions] += delta_W_masked
+        # Apply correction (vectorized)
+        W_corrected[:, selected_positions] += delta_W_masked
 
         # Convert back to original dtype
         W_corrected = W_corrected.to(weight_dtype)
