@@ -464,12 +464,14 @@ class WandaPrunerWithGreedyHessian:
                         print(f"      ⚠️  ERROR MISMATCH! Tracked={error_current:.6e}, Actual={actual_error:.6e}, Diff={error_diff:.6e}")
 
                 # Track for diagnostics
+                residual_norm = R.abs().mean().item()  # Track residual magnitude
                 position_improvements.append({
                     'position': idx,
                     'j': j_item,
                     'improvement': total_improvement,
                     'num_channels': num_channels_corrected,
                     'error_after': error_current,
+                    'residual_norm': residual_norm,  # Track how residual evolves
                 })
 
                 if debug and num_applied <= 5:
@@ -494,12 +496,9 @@ class WandaPrunerWithGreedyHessian:
         error_final = error_current
         error_reduction = error_initial - error_final
 
-        # Compute diminishing returns statistics
-        improvement_trend = None
-        if len(position_improvements) > 1:
-            first_half_avg = sum(p['improvement'] for p in position_improvements[:len(position_improvements)//2]) / (len(position_improvements)//2)
-            second_half_avg = sum(p['improvement'] for p in position_improvements[len(position_improvements)//2:]) / (len(position_improvements) - len(position_improvements)//2)
-            improvement_trend = second_half_avg / first_half_avg if first_half_avg > 0 else 0
+        # Simple statistics: what matters is total reduction
+        avg_improvement = sum(p['improvement'] for p in position_improvements) / len(position_improvements) if position_improvements else 0
+        avg_channels = sum(p['num_channels'] for p in position_improvements) / len(position_improvements) if position_improvements else 0
 
         correction_stats = {
             'error_before_mean': error_initial,
@@ -509,23 +508,21 @@ class WandaPrunerWithGreedyHessian:
             'num_applied': num_applied,
             'stopped_early': stopped_early,
             'apply_percentage': num_applied / len(candidate_positions) * 100 if len(candidate_positions) > 0 else 0,
-            'improvement_trend': improvement_trend,  # Ratio of 2nd half to 1st half improvements
-            'position_improvements': position_improvements,
+            'avg_improvement_per_position': avg_improvement,
+            'avg_channels_per_position': avg_channels,
         }
 
         if debug:
             print(f"    Error before: {error_initial:.6e}")
             print(f"    Error after: {error_final:.6e}")
             print(f"    Reduction: {error_reduction:.6e} ({error_reduction/error_initial*100 if error_initial > 0 else 0:.2f}%)")
-            print(f"    Applied: {num_applied}/{len(candidate_positions)} ({correction_stats['apply_percentage']:.1f}%)")
-            if improvement_trend is not None:
-                print(f"    Diminishing returns: 2nd half avg / 1st half avg = {improvement_trend:.3f}")
-                if improvement_trend < 0.5:
-                    print(f"      ⚠️  Improvements dropped by >50% - consider reducing correction magnitude!")
+            print(f"    Positions applied: {num_applied}/{len(candidate_positions)}")
+            print(f"    Avg improvement/position: {avg_improvement:.6e}")
+            print(f"    Avg channels corrected/position: {avg_channels:.1f}")
             if stopped_early:
-                print(f"    Status: Early stopping at position {num_applied}/{len(candidate_positions)}")
+                print(f"    Status: Early stopping (no more improvements found)")
             else:
-                print(f"    Status: Applied all candidate corrections")
+                print(f"    Status: Completed all candidate positions")
 
         # Cleanup - free GPU memory
         del X
