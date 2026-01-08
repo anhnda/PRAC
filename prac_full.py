@@ -349,14 +349,13 @@ class WandaPrunerWithFullHessian:
         RHS = torch.ones(out_features, num_selected, device=self.device) * (-errors.unsqueeze(1))
 
         try:
-            # Solve: H_sub @ Delta^T = RHS^T
-            # where Delta is [out_features, num_selected]
+            # Solve: H_sub @ X = RHS^T
+            # where X is [num_selected, out_features] and we want Delta = X^T
             # Using Cholesky decomposition for stability
             L = torch.linalg.cholesky(H_sub)
-            # cholesky_solve expects (B, A) and solves A @ X = B
-            # We need H_sub @ Delta^T = RHS^T
-            # So we pass RHS^T as B: [num_selected, out_features]
-            delta_W_all = torch.cholesky_solve(RHS.t().unsqueeze(-1), L).squeeze(-1).t()
+            # cholesky_solve(B, L) solves A @ X = B where A = L @ L^T
+            # RHS.t() is [num_selected, out_features], so we solve for each column
+            delta_W_all = torch.cholesky_solve(RHS.t(), L).t()
             # delta_W_all is now [out_features, num_selected]
 
         except RuntimeError as e:
