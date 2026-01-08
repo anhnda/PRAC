@@ -319,7 +319,7 @@ class WandaPrunerWithFullHessian:
         W_pruned_f32 = W_pruned.float()
         js_mean_f32 = js_mean.float()
 
-        # Move Hessian to device
+        # Hessian is already on GPU from calibration, just ensure float32
         hessian_f32 = hessian.float().to(self.device)
 
         # Compute reconstruction errors for all channels
@@ -532,7 +532,8 @@ class WandaPrunerWithFullHessian:
         Key difference from diagonal version:
             Accumulates H = X^T X [hidden_dim, hidden_dim] instead of just diag(X^T X)
 
-        Memory: O(hidden_dim^2) stored on CPU to avoid GPU OOM
+        Memory: O(hidden_dim^2) stored on GPU during calibration for speed.
+        Only moves to CPU after batch is done to free GPU memory.
         """
         def hook(module, input, output):
             if isinstance(input, tuple):
@@ -556,23 +557,24 @@ class WandaPrunerWithFullHessian:
             inp_flat = inp_flat.detach().float()
 
             # Initialize statistics storage if needed
+            # Store on GPU during calibration to avoid repeated CPU-GPU transfers
             if name not in self.activation_stats:
                 self.activation_stats[name] = {
-                    'hessian': torch.zeros(hidden_dim, hidden_dim, dtype=torch.float32),
-                    'mean_sum': torch.zeros(hidden_dim, dtype=torch.float32),
+                    'hessian': torch.zeros(hidden_dim, hidden_dim, dtype=torch.float32, device=inp.device),
+                    'mean_sum': torch.zeros(hidden_dim, dtype=torch.float32, device=inp.device),
                     'count': 0
                 }
 
             # Accumulate full Hessian: H += X^T X
-            # For memory efficiency, compute in batches if needed
+            # Keep everything on GPU during calibration
             stats = self.activation_stats[name]
 
-            # Compute X^T X incrementally on GPU, then move to CPU
+            # Compute X^T X and accumulate on GPU (no CPU transfer in hot loop!)
             hessian_update = torch.matmul(inp_flat.t(), inp_flat)  # [hidden_dim, hidden_dim]
-            stats['hessian'] += hessian_update.cpu()
+            stats['hessian'] += hessian_update
 
-            # Also accumulate mean for JS estimator
-            stats['mean_sum'] += inp_flat.sum(dim=0).cpu()
+            # Also accumulate mean for JS estimator (stay on GPU)
+            stats['mean_sum'] += inp_flat.sum(dim=0)
             stats['count'] += num_tokens
 
             del inp_flat, hessian_update
