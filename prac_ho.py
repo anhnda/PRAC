@@ -4,9 +4,9 @@ Wanda Pruning with Greedy Direct Error Correction (prac_ho.py)
 Implements greedy iterative correction using DIRECT activation error measurement
 with OPTIMIZED residual-based incremental updates.
 
-Key Difference from prac_h.py:
-    This version selects the WEAKEST surviving weights (smallest Wanda scores)
-    for correction, rather than using the Kneedle algorithm to find "moderate" weights.
+Key Differences from prac_h.py:
+    1. Selects WEAKEST surviving weights (smallest Wanda scores) for correction
+    2. L2 salience computed from ALL tokens (matches prac_full.py when --no-correction used)
 
 Mathematical Foundation:
     Directly minimize the reconstruction error on calibration data:
@@ -60,8 +60,12 @@ Benefits:
     - **Efficient**: 1000x+ faster than naive approach via residual-based updates
     - **Adaptive**: Natural early stopping when improvements plateau
     - **Stable**: Small fixed magnitude prevents network disruption
-    - **Memory efficient**: Stores activations on CPU, moves to GPU only during correction
+    - **Memory efficient**:
+        * Stores only limited activations (8192 tokens default) for correction
+        * But computes L2 salience from ALL tokens via incremental squared_sum
+        * Much less memory than full Hessian (O(d) vs O(d²))
     - **Focused**: Targets weakest surviving weights for maximum impact
+    - **Consistent**: With --no-correction, produces identical results to prac_full.py
 
 Usage:
     python prac_ho.py --sparsity 0.5 --percent-change 0.05 --correction-magnitude 0.01
@@ -152,15 +156,16 @@ class WandaPrunerWithGreedyHessian:
 
         # Storage for activation samples (for direct error measurement)
         # Memory: O(max_activation_samples * hidden_dim) per layer
-        self.activation_stats = {}  # Dict of {name: {'activations': tensor, 'mean_sum': tensor, 'count': int}}
+        # Note: L2 salience uses ALL tokens via squared_sum (not limited by max_activation_samples)
+        self.activation_stats = {}  # Dict of {name: {'activations': tensor, 'squared_sum': tensor, 'mean_sum': tensor, 'count': int}}
         self.hooks = []
         self.layer_stats = {}
 
         print(f"\n[Wanda Pruner with Greedy Direct Error Correction]")
         print(f"  Target sparsity: {sparsity*100:.1f}% (keep {(1-sparsity)*100:.1f}%)")
         print(f"  Token subsampling: {max_tokens_per_sample} tokens/sample")
-        print(f"  Max activation samples: {max_activation_samples} tokens/layer")
-        print(f"  Salience metric: ||X_j||_2 (L2 norm from activations)")
+        print(f"  Max activation samples: {max_activation_samples} tokens/layer (for correction phase)")
+        print(f"  Salience metric: ||X_j||_2 (L2 norm from ALL tokens)")
         print(f"  Scoring: Score_ij = |W_ij| * ||X_j||_2")
         print(f"  Error measurement: Direct ||X·W^T - X·W_orig^T||² on calibration data")
         if use_correction:
@@ -177,7 +182,10 @@ class WandaPrunerWithGreedyHessian:
     @torch.no_grad()
     def get_activation_stats(self, name):
         """
-        Compute L2 salience and James-Stein mean from stored activations.
+        Compute L2 salience and James-Stein mean from accumulated statistics.
+
+        L2 salience is computed from ALL tokens (not limited by max_activation_samples).
+        This ensures consistency with prac_full.py when --no-correction is used.
 
         Returns:
             tuple: (l2_salience, js_mean, raw_mean, activations)
@@ -188,26 +196,28 @@ class WandaPrunerWithGreedyHessian:
         stats = self.activation_stats[name]
 
         # Check if we have any data
-        if stats['count'] == 0 or 'activations' not in stats:
+        if stats['count'] == 0:
             return None, None, None, None
 
-        # Concatenate activation samples if still a list
-        if isinstance(stats['activations'], list):
-            if len(stats['activations']) == 0:
-                return None, None, None, None
-            stats['activations'] = torch.cat(stats['activations'], dim=0)  # [total_tokens, hidden_dim]
-
-        # Get stored activations [num_samples, hidden_dim]
-        activations = stats['activations']
-
-        # L2 salience: sqrt(mean(X_j^2))
-        l2_salience = torch.sqrt((activations ** 2).mean(dim=0))
+        # L2 salience from accumulated squared sums (ALL tokens, not just stored ones)
+        # This matches prac_full.py: sqrt(diag(Hessian) / count) = sqrt(sum(X_j^2) / count)
+        l2_salience = torch.sqrt(stats['squared_sum'] / stats['count'])
 
         # Mean from accumulated sums
         raw_mean = stats['mean_sum'] / stats['count']
 
         # Apply James-Stein estimator
         js_mean = compute_james_stein_mean(raw_mean)
+
+        # Get stored activations for correction (if needed)
+        activations = None
+        if 'activations' in stats:
+            # Concatenate activation samples if still a list
+            if isinstance(stats['activations'], list):
+                if len(stats['activations']) > 0:
+                    activations = torch.cat(stats['activations'], dim=0)  # [total_tokens, hidden_dim]
+            else:
+                activations = stats['activations']
 
         return l2_salience, js_mean, raw_mean, activations
 
@@ -551,10 +561,17 @@ class WandaPrunerWithGreedyHessian:
 
             # Correct weights using greedy iterative approach with direct error measurement
             if selection_info is not None and len(candidate_positions) > 0:
-                W_final, correction_stats = self.correct_weights_greedy_direct(
-                    W_device, W_pruned, js_mean_device, activations,
-                    candidate_positions, prune_mask, debug=debug
-                )
+                # Check if we have activations for correction
+                if activations is not None:
+                    W_final, correction_stats = self.correct_weights_greedy_direct(
+                        W_device, W_pruned, js_mean_device, activations,
+                        candidate_positions, prune_mask, debug=debug
+                    )
+                else:
+                    if debug:
+                        print(f"  ⚠️ No stored activations for correction, skipping")
+                    W_final = W_pruned
+                    correction_stats = None
             else:
                 W_final = W_pruned
                 correction_stats = None
@@ -592,10 +609,15 @@ class WandaPrunerWithGreedyHessian:
 
     def get_hook(self, name):
         """
-        Create hook for storing activation samples.
+        Create hook for storing activation samples and computing statistics.
 
-        Instead of Hessian (O(d²)), stores activation samples (O(samples × d)).
-        Much faster and more memory efficient!
+        Key difference from prac_full.py:
+        - Stores LIMITED activation samples (O(samples × d)) for correction phase
+        - But accumulates squared_sum for ALL tokens for L2 salience (matching prac_full.py)
+
+        This ensures:
+        - Memory efficient correction (only stores max_activation_samples)
+        - Identical L2 salience to prac_full.py (uses ALL tokens)
         """
         def hook(module, input, output):
             if isinstance(input, tuple):
@@ -621,16 +643,24 @@ class WandaPrunerWithGreedyHessian:
             # Initialize statistics storage if needed
             if name not in self.activation_stats:
                 self.activation_stats[name] = {
-                    'activations': [],  # Store samples as list (will concatenate later)
-                    'mean_sum': torch.zeros(hidden_dim, dtype=torch.float32, device=inp.device),
+                    'activations': [],  # Store LIMITED samples for correction (memory efficient)
+                    'squared_sum': torch.zeros(hidden_dim, dtype=torch.float32, device=inp.device),  # For L2 salience (ALL tokens)
+                    'mean_sum': torch.zeros(hidden_dim, dtype=torch.float32, device=inp.device),  # For JS estimator (ALL tokens)
                     'count': 0,
-                    'num_stored': 0  # Track number of tokens stored
+                    'num_stored': 0  # Track number of tokens stored for correction
                 }
 
-            # Store activation samples
             stats = self.activation_stats[name]
 
-            # Only store if under the limit (to prevent OOM)
+            # ALWAYS accumulate squared_sum for L2 salience (ALL tokens, no limit)
+            # This ensures L2 salience matches prac_full.py when --no-correction is used
+            stats['squared_sum'] += (inp_flat ** 2).sum(dim=0)
+
+            # ALWAYS accumulate mean for JS estimator (ALL tokens, no limit)
+            stats['mean_sum'] += inp_flat.sum(dim=0)
+            stats['count'] += num_tokens
+
+            # Store LIMITED activation samples for correction phase only (to prevent OOM)
             if stats['num_stored'] < self.max_activation_samples:
                 # How many tokens can we store?
                 remaining = self.max_activation_samples - stats['num_stored']
@@ -640,18 +670,17 @@ class WandaPrunerWithGreedyHessian:
                 stats['activations'].append(inp_flat[:num_to_store].cpu())
                 stats['num_stored'] += num_to_store
 
-            # Always accumulate mean for JS estimator (keep on GPU for speed)
-            stats['mean_sum'] += inp_flat.sum(dim=0)
-            stats['count'] += num_tokens
-
         return hook
 
     def calibrate_layer_batch(self, layer_names_batch, calibration_data, n_samples=500):
         """
-        Calibrate batch of layers by storing activation samples.
+        Calibrate batch of layers by storing activation samples and computing statistics.
 
-        Note: This requires O(n_samples × hidden_dim) memory per layer batch.
-        Much faster than Hessian computation!
+        Memory usage:
+        - Squared_sum for L2 salience: O(hidden_dim) - ALL tokens, very efficient!
+        - Stored activations for correction: O(max_activation_samples × hidden_dim) - limited for memory efficiency
+
+        This approach is much faster than full Hessian computation (O(hidden_dim²))!
         """
         # Clear previous statistics for this batch
         for name, _ in layer_names_batch:
@@ -701,8 +730,12 @@ class WandaPrunerWithGreedyHessian:
         """
         Batched sequential pruning with greedy direct error correction.
 
-        Note: Stores activation samples O(n_samples × hidden_dim) per layer.
-        Much faster than Hessian-based methods!
+        Key features:
+        - L2 salience computed from ALL tokens via squared_sum (matches prac_full.py)
+        - Activation samples limited to max_activation_samples for memory efficiency
+        - Much faster than full Hessian methods (O(d²))!
+
+        When --no-correction is used, produces identical results to prac_full.py --no-correction.
         """
         print("\n" + "=" * 80)
         print("BATCHED SEQUENTIAL PRUNING WITH GREEDY DIRECT ERROR CORRECTION")
