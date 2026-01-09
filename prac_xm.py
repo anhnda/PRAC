@@ -4,33 +4,34 @@ Wanda Pruning with Weakest Weight Correction - XM Version
 Combines Wanda pruning with weakest surviving weight correction:
 1. Apply Wanda pruning (Score_ij = |W_ij| * ||X_j||_2)
 2. Select WEAKEST surviving weights (smallest Wanda scores) based on fixed percentage
-3. Correct weights at weakest positions to minimize reconstruction error
-4. Fully vectorized across all output channels
+3. Correct weights greedily at weakest positions to minimize dot product error
+4. Early stopping when error approaches 0 or no improvement
 
 Key Features:
 - L2 norm salience for Wanda scoring
 - James-Stein mean estimator for weight correction
 - Weakest-first selection: targets surviving weights with smallest L2 salience
 - Simple fixed-percentage selection (NO Kneedle algorithm)
-- NO clamping: direct correction without magnitude constraints
+- Greedy iterative correction (like prac_ho.py)
+- Fixed magnitude changes: correction_magnitude * |W_orig[i,j]|
 - Objective: Minimize dot product error with JS mean
-- Vectorized correction across all channels
+- Early stopping: stops when no improvement or error close to 0
 - Batched sequential processing for memory efficiency
 
 Differences from prac_xl.py:
 - NO Kneedle algorithm for position selection
 - Selects WEAKEST surviving weights (smallest Wanda scores) like prac_ho.py
-- NO clamping (unconstrained correction)
-- Simpler, more direct approach
+- Greedy iterative correction (not batch vectorized)
+- Fixed magnitude with early stopping
 
 Differences from prac_ho.py:
 - Objective function: dot product with JS mean (not direct activation error)
-- No greedy iterative search
-- NO clamping (prac_ho.py has fixed magnitude constraints)
-- Vectorized batch correction (all positions at once)
+- Same greedy iterative approach
+- Same fixed magnitude correction style
+- Same early stopping mechanism
 
 Usage:
-    python prac_xm.py --sparsity 0.5 --percent-change 0.05
+    python prac_xm.py --sparsity 0.5 --percent-change 0.05 --correction-magnitude 0.01
 """
 
 import torch
@@ -98,7 +99,7 @@ class WandaPrunerWithCorrection:
     """
     Wanda Pruning with Weakest Weight Correction (XM Version).
     Selects and corrects weakest surviving weights (smallest Wanda scores).
-    Fully vectorized for all output channels.
+    Uses greedy iterative correction with fixed magnitude and early stopping.
     """
 
     def __init__(self, model, tokenizer, device="cuda", sparsity=0.5,
@@ -128,9 +129,10 @@ class WandaPrunerWithCorrection:
         if use_correction:
             print(f"  Weakest weight correction: ENABLED")
             print(f"    - Selection: WEAKEST {percent_change*100:.1f}% of surviving weights (smallest Wanda scores)")
+            print(f"    - Method: Greedy iterative (like prac_ho.py)")
+            print(f"    - Magnitude: {correction_magnitude*100:.1f}% of original weight")
             print(f"    - Objective: Minimize dot product error with JS mean")
-            print(f"    - NO clamping (unconstrained correction)")
-            print(f"    - NO Kneedle algorithm (simple fixed percentage)")
+            print(f"    - Early stopping: when no improvement or error close to 0")
         else:
             print(f"  Weakest weight correction: DISABLED")
         print(f"  Special: lm_head is NOT pruned")
@@ -229,20 +231,23 @@ class WandaPrunerWithCorrection:
         return selected_indices, selection_info
 
     @torch.no_grad()
-    def correct_weights_vectorized(self, W_orig, W_pruned, js_mean,
-                                   selected_positions, prune_mask, debug=False):
+    def correct_weights_greedy(self, W_orig, W_pruned, js_mean,
+                               selected_positions, prune_mask, debug=False):
         """
-        Vectorized weight correction across all output channels.
+        Greedy iterative weight correction (prac_ho.py style).
 
         Key: Only corrects SURVIVING weakest weights (not pruned ones).
-        NO clamping - applies unconstrained corrections.
+        Fixed magnitude correction with early stopping.
 
-        For each output channel i:
-            error[i] = (W_pruned[i,:] - W_orig[i,:]) · js_mean
-
-        For each weakest position j (among survivors):
-            delta_W[i,j] = -error[i] * sign(js_mean[j]) / sum(|js_mean[selected]|)
-            But only if W_pruned[i,j] != 0 (i.e., weight survived pruning)
+        Algorithm (greedy, position by position):
+        1. Compute initial error: error[i] = (W_pruned[i,:] - W_orig[i,:]) · js_mean
+        2. For each weakest position j (in order):
+           a. For all channels: delta[i] = correction_magnitude * W_orig[i,j]
+           b. Try +delta and -delta, compute error changes (vectorized)
+           c. Apply the direction that reduces error for each channel
+           d. Update error vector
+           e. If improvement > 0: continue
+           f. If no improvement or error close to 0: stop early
 
         Args:
             W_orig: Original weights [out_features, in_features]
@@ -264,59 +269,141 @@ class WandaPrunerWithCorrection:
         W_pruned_f32 = W_pruned.float()
         js_mean_f32 = js_mean.float()
 
-        # Compute reconstruction errors for all channels
+        # Compute initial reconstruction errors for all channels
         # error[i] = (W_pruned[i,:] - W_orig[i,:]) · js_mean
-        W_diff = W_pruned_f32 - W_orig_f32
-        errors = torch.matmul(W_diff, js_mean_f32)  # [out_features]
+        W_current = W_pruned_f32.clone()
+        errors = torch.matmul(W_current - W_orig_f32, js_mean_f32)  # [out_features]
+        error_current = errors.abs().sum().item()
+        error_initial = error_current
 
-        # Sum of |js_mean| at selected positions
-        sum_abs_js_mean = js_mean_f32[selected_positions].abs().sum()
-
-        if sum_abs_js_mean < 1e-10:
+        if len(selected_positions) == 0:
             if debug:
-                print(f"    ⚠️ Sum too small, no correction")
+                print(f"    ⚠️ No candidates, no correction")
             return W_pruned.clone(), None
 
-        # Vectorized correction
-        W_corrected = W_pruned_f32.clone()
+        # Greedy correction: process each candidate position
+        num_applied = 0
+        stopped_early = False
+        position_improvements = []
 
-        # For each weakest position j:
-        # delta_W[:,j] = -errors * sign(js_mean[j]) / sum_abs_js_mean
-        # NO clamping - direct correction
-        # Only apply to SURVIVING weights (where prune_mask[:, j] == True)
+        for idx, j in enumerate(selected_positions):
+            j_item = j.item()
 
-        prune_mask_f32 = prune_mask.float()
+            # Only correct surviving weights at this position
+            survivors_at_j = prune_mask[:, j]  # [out_features]
+            if not survivors_at_j.any():
+                continue
 
-        for j in selected_positions:
-            sign_val = torch.sign(js_mean_f32[j])
+            # VECTORIZED: evaluate all channels at position j simultaneously
+            # For each channel i, changing W[i,j] by ±delta changes error[i]
 
-            # Compute correction delta (NO clamping)
-            delta_W_j = -errors * sign_val / sum_abs_js_mean
+            # Compute delta values for all channels: [out_features]
+            deltas = self.correction_magnitude * W_orig_f32[:, j]  # [out_features]
 
-            # Only apply correction to SURVIVING weights
-            # If weight was pruned (prune_mask[:, j] == False), don't correct it
-            delta_W_j_masked = delta_W_j * prune_mask_f32[:, j]
+            # For W[i,j] → W[i,j] + delta[i]:
+            # New error[i] = error[i] + delta[i] * js_mean[j]
+            js_mean_j = js_mean_f32[j]
 
-            W_corrected[:, j] += delta_W_j_masked
+            # Error changes (vectorized across all channels)
+            delta_error_pos = deltas * js_mean_j  # Change in error if we add delta
+            delta_error_neg = -deltas * js_mean_j  # Change in error if we subtract delta
+
+            # We want to reduce |error|, so:
+            # If error > 0, we want negative delta_error (reduce error)
+            # If error < 0, we want positive delta_error (reduce |error|)
+
+            # Compute new absolute errors for both directions
+            new_error_pos = (errors + delta_error_pos).abs()
+            new_error_neg = (errors + delta_error_neg).abs()
+            current_abs_error = errors.abs()
+
+            # Determine which channels benefit from each direction
+            # Only consider surviving weights at this position
+            pos_improves = (new_error_pos < current_abs_error) & (new_error_pos <= new_error_neg) & survivors_at_j
+            neg_improves = (new_error_neg < current_abs_error) & ~pos_improves & survivors_at_j
+
+            # Compute total improvement
+            improvement_pos = (current_abs_error[pos_improves] - new_error_pos[pos_improves]).sum().item() if pos_improves.any() else 0.0
+            improvement_neg = (current_abs_error[neg_improves] - new_error_neg[neg_improves]).sum().item() if neg_improves.any() else 0.0
+            total_improvement = improvement_pos + improvement_neg
+
+            # Check if we should stop (error close to 0 or no improvement)
+            if total_improvement <= 0:
+                stopped_early = True
+                if debug:
+                    print(f"      Stopped at position {idx+1}/{len(selected_positions)}: no improvement")
+                break
+
+            # Check if error is already close to 0
+            if error_current < 1e-6:
+                stopped_early = True
+                if debug:
+                    print(f"      Stopped at position {idx+1}/{len(selected_positions)}: error close to 0")
+                break
+
+            # Apply corrections vectorized
+            if pos_improves.any():
+                # Apply positive corrections
+                W_current[pos_improves, j] += deltas[pos_improves]
+                errors[pos_improves] += delta_error_pos[pos_improves]
+
+            if neg_improves.any():
+                # Apply negative corrections
+                W_current[neg_improves, j] -= deltas[neg_improves]
+                errors[neg_improves] += delta_error_neg[neg_improves]
+
+            error_current -= total_improvement
+            num_applied += 1
+            num_channels_corrected = pos_improves.sum().item() + neg_improves.sum().item()
+
+            # Track for diagnostics
+            position_improvements.append({
+                'position': idx,
+                'j': j_item,
+                'improvement': total_improvement,
+                'num_channels': num_channels_corrected,
+                'error_after': error_current,
+            })
+
+            if debug and num_applied <= 5:
+                print(f"      Position {idx+1}/{len(selected_positions)}: j={j_item}, "
+                      f"channels={num_channels_corrected}, improvement={total_improvement:.6e}, "
+                      f"error={error_current:.6e}")
 
         # Convert back to original dtype
-        W_corrected = W_corrected.to(weight_dtype)
+        W_corrected = W_current.to(weight_dtype)
 
-        # Compute correction statistics (in float32 for accuracy)
-        errors_after = torch.matmul(W_corrected.float() - W_orig_f32, js_mean_f32)
-        error_reduction = (errors.abs() - errors_after.abs()).mean().item()
+        # Final error
+        error_final = error_current
+        error_reduction = error_initial - error_final
+
+        # Simple statistics
+        avg_improvement = sum(p['improvement'] for p in position_improvements) / len(position_improvements) if position_improvements else 0
+        avg_channels = sum(p['num_channels'] for p in position_improvements) / len(position_improvements) if position_improvements else 0
 
         correction_stats = {
-            'error_before_mean': errors.abs().mean().item(),
-            'error_after_mean': errors_after.abs().mean().item(),
+            'error_before_mean': error_initial,
+            'error_after_mean': error_final,
             'error_reduction_mean': error_reduction,
-            'num_corrected_positions': len(selected_positions),
+            'num_candidates': len(selected_positions),
+            'num_applied': num_applied,
+            'stopped_early': stopped_early,
+            'apply_percentage': num_applied / len(selected_positions) * 100 if len(selected_positions) > 0 else 0,
+            'avg_improvement_per_position': avg_improvement,
+            'avg_channels_per_position': avg_channels,
         }
 
         if debug:
-            print(f"    Error before: {correction_stats['error_before_mean']:.6f}")
-            print(f"    Error after: {correction_stats['error_after_mean']:.6f}")
-            print(f"    Reduction: {error_reduction:.6f}")
+            print(f"    Error before: {error_initial:.6e}")
+            print(f"    Error after: {error_final:.6e}")
+            print(f"    Reduction: {error_reduction:.6e} ({error_reduction/error_initial*100 if error_initial > 0 else 0:.2f}%)")
+            print(f"    Positions applied: {num_applied}/{len(selected_positions)}")
+            print(f"    Avg improvement/position: {avg_improvement:.6e}")
+            print(f"    Avg channels corrected/position: {avg_channels:.1f}")
+            if stopped_early:
+                print(f"    Status: Early stopping")
+            else:
+                print(f"    Status: Completed all candidate positions")
 
         return W_corrected, correction_stats
 
@@ -353,8 +440,9 @@ class WandaPrunerWithCorrection:
     @torch.no_grad()
     def prune_layer(self, name, module, debug=False):
         """
-        Prune layer with optional weakest weight correction.
-        Selects and corrects the weakest surviving weights (smallest Wanda scores).
+        Prune layer with optional greedy weakest weight correction.
+        Selects and greedily corrects the weakest surviving weights (smallest Wanda scores).
+        Uses fixed magnitude changes with early stopping.
         """
         if name not in self.activation_stats:
             print(f"  ⚠️  No activation stats for {name}, skipping")
@@ -392,9 +480,9 @@ class WandaPrunerWithCorrection:
                 l2_salience_device, prune_mask, debug=debug
             )
 
-            # Correct weights (only surviving ones)
+            # Correct weights greedily (only surviving ones)
             if selection_info is not None and len(selected_positions) > 0:
-                W_final, correction_stats = self.correct_weights_vectorized(
+                W_final, correction_stats = self.correct_weights_greedy(
                     W_device, W_pruned, js_mean_device, selected_positions,
                     prune_mask, debug=debug
                 )
@@ -529,9 +617,9 @@ class WandaPrunerWithCorrection:
                 }
 
     def prune_model_sequential(self, calibration_data, n_samples=500, layer_batch_size=16):
-        """Batched sequential pruning with weakest weight correction."""
+        """Batched sequential pruning with greedy weakest weight correction."""
         print("\n" + "=" * 80)
-        print("BATCHED SEQUENTIAL PRUNING WITH WEAKEST WEIGHT CORRECTION (XM Version)")
+        print("BATCHED SEQUENTIAL PRUNING WITH GREEDY WEAKEST WEIGHT CORRECTION (XM Version)")
         print("=" * 80)
 
         if HAS_PSUTIL:
@@ -613,11 +701,19 @@ class WandaPrunerWithCorrection:
                                    for k in corrected_layers]
                     reductions = [self.layer_stats[k]['correction_stats']['error_reduction_mean']
                                  for k in corrected_layers]
+                    num_applied = [self.layer_stats[k]['correction_stats']['num_applied']
+                                  for k in corrected_layers]
+                    apply_pcts = [self.layer_stats[k]['correction_stats']['apply_percentage']
+                                 for k in corrected_layers]
+                    stopped_early_count = sum(1 for k in corrected_layers
+                                            if self.layer_stats[k]['correction_stats'].get('stopped_early', False))
 
-                    print(f"\nWeakest weight correction statistics ({len(corrected_layers)} layers):")
-                    print(f"  Mean error before: {np.mean(errors_before):.6f}")
-                    print(f"  Mean error after: {np.mean(errors_after):.6f}")
-                    print(f"  Mean reduction: {np.mean(reductions):.6f}")
+                    print(f"\nGreedy weakest weight correction statistics ({len(corrected_layers)} layers):")
+                    print(f"  Mean error before: {np.mean(errors_before):.6e}")
+                    print(f"  Mean error after: {np.mean(errors_after):.6e}")
+                    print(f"  Mean reduction: {np.mean(reductions):.6e} ({np.mean(reductions)/np.mean(errors_before)*100:.2f}%)")
+                    print(f"  Mean corrections applied: {np.mean(num_applied):.1f} ({np.mean(apply_pcts):.1f}% of candidates)")
+                    print(f"  Early stopping: {stopped_early_count}/{len(corrected_layers)} layers")
 
         # Final cleanup
         self.activation_stats = {}
@@ -635,7 +731,7 @@ def load_wikitext2_simple(n_samples=128):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Wanda Pruning with Weakest Weight Correction (XM Version)",
+        description="Wanda Pruning with Greedy Weakest Weight Correction (XM Version)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
@@ -650,7 +746,7 @@ def main():
     parser.add_argument("--percent-change", type=float, default=0.05,
                        help="Percentage of weakest surviving weights to correct (default 5%%)")
     parser.add_argument("--correction-magnitude", type=float, default=0.01,
-                       help="[NOT USED - kept for compatibility] Correction magnitude parameter (no clamping in XM version)")
+                       help="Fixed correction magnitude as fraction of original weight (default 1%%)")
     parser.add_argument("--output-dir", type=str, default="./pruned_models/model_prac_xm",
                        help="Output directory")
     parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
@@ -674,16 +770,17 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
-    print("Wanda Pruning with Weakest Weight Correction (XM Version)")
+    print("Wanda Pruning with Greedy Weakest Weight Correction (XM Version)")
     print(f"Target Model: {model_name}")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Target Sparsity: {args.sparsity*100:.1f}%")
     print(f"Layer Batch Size: {args.layer_batch_size}")
-    print(f"Weakest weight correction: {args.use_correction}")
+    print(f"Greedy weakest weight correction: {args.use_correction}")
     if args.use_correction:
         print(f"  Correction percent: {args.percent_change*100:.1f}% (weakest surviving weights)")
-        print(f"  NO clamping (unconstrained correction)")
+        print(f"  Correction magnitude: {args.correction_magnitude*100:.1f}%")
+        print(f"  Method: Greedy iterative with early stopping")
     print("=" * 80)
 
     # Load model
