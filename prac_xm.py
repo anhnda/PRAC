@@ -12,7 +12,7 @@ Key Features:
 - James-Stein mean estimator for weight correction
 - Weakest-first selection: targets surviving weights with smallest L2 salience
 - Simple fixed-percentage selection (NO Kneedle algorithm)
-- Fixed correction magnitude (similar to prac_ho.py)
+- NO clamping: direct correction without magnitude constraints
 - Objective: Minimize dot product error with JS mean
 - Vectorized correction across all channels
 - Batched sequential processing for memory efficiency
@@ -20,16 +20,17 @@ Key Features:
 Differences from prac_xl.py:
 - NO Kneedle algorithm for position selection
 - Selects WEAKEST surviving weights (smallest Wanda scores) like prac_ho.py
-- Fixed correction magnitude (not adaptive clamping)
+- NO clamping (unconstrained correction)
 - Simpler, more direct approach
 
 Differences from prac_ho.py:
 - Objective function: dot product with JS mean (not direct activation error)
 - No greedy iterative search
+- NO clamping (prac_ho.py has fixed magnitude constraints)
 - Vectorized batch correction (all positions at once)
 
 Usage:
-    python prac_xm.py --sparsity 0.5 --percent-change 0.05 --correction-magnitude 0.01
+    python prac_xm.py --sparsity 0.5 --percent-change 0.05
 """
 
 import torch
@@ -127,8 +128,8 @@ class WandaPrunerWithCorrection:
         if use_correction:
             print(f"  Weakest weight correction: ENABLED")
             print(f"    - Selection: WEAKEST {percent_change*100:.1f}% of surviving weights (smallest Wanda scores)")
-            print(f"    - Correction magnitude: {correction_magnitude*100:.1f}% of original weight")
             print(f"    - Objective: Minimize dot product error with JS mean")
+            print(f"    - NO clamping (unconstrained correction)")
             print(f"    - NO Kneedle algorithm (simple fixed percentage)")
         else:
             print(f"  Weakest weight correction: DISABLED")
@@ -234,13 +235,13 @@ class WandaPrunerWithCorrection:
         Vectorized weight correction across all output channels.
 
         Key: Only corrects SURVIVING weakest weights (not pruned ones).
-        Uses fixed correction magnitude (like prac_ho.py).
+        NO clamping - applies unconstrained corrections.
 
         For each output channel i:
             error[i] = (W_pruned[i,:] - W_orig[i,:]) · js_mean
 
         For each weakest position j (among survivors):
-            delta_W[i,j] = -error[i] * sign(js_mean[j]) * magnitude / sum(|js_mean[selected]|)
+            delta_W[i,j] = -error[i] * sign(js_mean[j]) / sum(|js_mean[selected]|)
             But only if W_pruned[i,j] != 0 (i.e., weight survived pruning)
 
         Args:
@@ -279,13 +280,9 @@ class WandaPrunerWithCorrection:
         # Vectorized correction
         W_corrected = W_pruned_f32.clone()
 
-        # Track clamping statistics
-        num_clamped = 0
-        total_corrections = 0
-
-        # For each moderate position j:
-        # delta_W[:,j] = -errors * sign(js_mean[j]) * magnitude / sum_abs_js_mean
-        # Fixed magnitude constraint: magnitude * |W_orig[i,j]|
+        # For each weakest position j:
+        # delta_W[:,j] = -errors * sign(js_mean[j]) / sum_abs_js_mean
+        # NO clamping - direct correction
         # Only apply to SURVIVING weights (where prune_mask[:, j] == True)
 
         prune_mask_f32 = prune_mask.float()
@@ -293,25 +290,12 @@ class WandaPrunerWithCorrection:
         for j in selected_positions:
             sign_val = torch.sign(js_mean_f32[j])
 
-            # Base correction (without magnitude constraint)
-            base_correction = -errors * sign_val / sum_abs_js_mean
-
-            # Apply fixed magnitude: delta = magnitude * W_orig
-            max_change = self.correction_magnitude * W_orig_f32[:, j].abs()
-
-            # Clamp delta to fixed magnitude constraint
-            delta_W_j = torch.clamp(base_correction, -max_change, max_change)
+            # Compute correction delta (NO clamping)
+            delta_W_j = -errors * sign_val / sum_abs_js_mean
 
             # Only apply correction to SURVIVING weights
             # If weight was pruned (prune_mask[:, j] == False), don't correct it
             delta_W_j_masked = delta_W_j * prune_mask_f32[:, j]
-
-            # Track how many were clamped (only among survivors)
-            survivors_at_j = prune_mask[:, j]
-            if survivors_at_j.sum() > 0:
-                was_clamped = ((base_correction.abs() > max_change) & survivors_at_j).sum().item()
-                num_clamped += was_clamped
-                total_corrections += survivors_at_j.sum().item()
 
             W_corrected[:, j] += delta_W_j_masked
 
@@ -327,16 +311,12 @@ class WandaPrunerWithCorrection:
             'error_after_mean': errors_after.abs().mean().item(),
             'error_reduction_mean': error_reduction,
             'num_corrected_positions': len(selected_positions),
-            'num_clamped': num_clamped,
-            'total_corrections': total_corrections,
-            'clamp_percentage': num_clamped / total_corrections * 100 if total_corrections > 0 else 0,
         }
 
         if debug:
             print(f"    Error before: {correction_stats['error_before_mean']:.6f}")
             print(f"    Error after: {correction_stats['error_after_mean']:.6f}")
             print(f"    Reduction: {error_reduction:.6f}")
-            print(f"    Clamped: {num_clamped}/{total_corrections} ({correction_stats['clamp_percentage']:.1f}%)")
 
         return W_corrected, correction_stats
 
@@ -633,14 +613,11 @@ class WandaPrunerWithCorrection:
                                    for k in corrected_layers]
                     reductions = [self.layer_stats[k]['correction_stats']['error_reduction_mean']
                                  for k in corrected_layers]
-                    clamp_pcts = [self.layer_stats[k]['correction_stats']['clamp_percentage']
-                                 for k in corrected_layers]
 
                     print(f"\nWeakest weight correction statistics ({len(corrected_layers)} layers):")
                     print(f"  Mean error before: {np.mean(errors_before):.6f}")
                     print(f"  Mean error after: {np.mean(errors_after):.6f}")
                     print(f"  Mean reduction: {np.mean(reductions):.6f}")
-                    print(f"  Mean clamp %: {np.mean(clamp_pcts):.1f}% (range: {np.min(clamp_pcts):.1f}% - {np.max(clamp_pcts):.1f}%)")
 
         # Final cleanup
         self.activation_stats = {}
@@ -673,7 +650,7 @@ def main():
     parser.add_argument("--percent-change", type=float, default=0.05,
                        help="Percentage of weakest surviving weights to correct (default 5%%)")
     parser.add_argument("--correction-magnitude", type=float, default=0.01,
-                       help="Fixed correction magnitude as fraction of original weight (default 1%%)")
+                       help="[NOT USED - kept for compatibility] Correction magnitude parameter (no clamping in XM version)")
     parser.add_argument("--output-dir", type=str, default="./pruned_models/model_prac_xm",
                        help="Output directory")
     parser.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3",
@@ -706,7 +683,7 @@ def main():
     print(f"Weakest weight correction: {args.use_correction}")
     if args.use_correction:
         print(f"  Correction percent: {args.percent_change*100:.1f}% (weakest surviving weights)")
-        print(f"  Correction magnitude: {args.correction_magnitude*100:.1f}%")
+        print(f"  NO clamping (unconstrained correction)")
     print("=" * 80)
 
     # Load model
